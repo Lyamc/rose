@@ -406,10 +406,72 @@ pub fn build_platform_verified_client_config_with_cert(
     finish_client_config(provider, Arc::new(verifier), client_cert)
 }
 
+/// Rejects every client certificate.
+///
+/// Used when `authorized_certs/` has no trust anchors. rustls refuses to build
+/// a webpki verifier without at least one anchor, and a freshly installed
+/// server has none until an administrator copies a client certificate in.
+#[derive(Debug)]
+struct RejectAllClients {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RejectAllClients {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Builds a quinn `ServerConfig` that requires mutual TLS client authentication.
 ///
 /// Loads all `.crt` files from `authorized_certs_dir` as trusted client certificate
-/// authorities.
+/// authorities. An empty directory still produces a listening server; every client
+/// is refused until a certificate is added and the server is restarted.
 ///
 /// # Errors
 ///
@@ -419,6 +481,7 @@ pub fn build_mutual_tls_server_config(
     authorized_certs_dir: &Path,
 ) -> Result<quinn::ServerConfig, ConfigError> {
     let mut root_store = rustls::RootCertStore::empty();
+    let mut authorized = 0usize;
 
     if authorized_certs_dir.exists() {
         for entry in std::fs::read_dir(authorized_certs_dir)? {
@@ -428,17 +491,28 @@ pub fn build_mutual_tls_server_config(
                 let cert_data = std::fs::read(&path)?;
                 let cert_der = CertificateDer::from(cert_data);
                 root_store.add(cert_der)?;
+                authorized += 1;
             }
         }
     }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(root_store),
-        Arc::clone(&provider),
-    )
-    .build()
-    .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?;
+    let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if authorized == 0 {
+        tracing::warn!(
+            directory = %authorized_certs_dir.display(),
+            "no authorized client certificates; refusing all clients until one is added and the server is restarted"
+        );
+        Arc::new(RejectAllClients {
+            provider: Arc::clone(&provider),
+        })
+    } else {
+        rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
+    };
     let rustls_config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ConfigError::QuicCrypto(e.to_string()))?
@@ -538,6 +612,13 @@ fn finish_client_config(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutual_tls_server_config_allows_an_empty_client_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        build_mutual_tls_server_config(&cert, dir.path()).unwrap();
+    }
 
     #[test]
     fn generate_cert_roundtrip() {

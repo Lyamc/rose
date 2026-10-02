@@ -224,6 +224,8 @@ in
         Files already in that directory are left in place.
         The server reads the directory at startup, so adding a certificate
         restarts the service when it changes this option.
+        An empty directory still lets the service listen. Every client is
+        refused until a certificate is added and the service is restarted.
       '';
     };
 

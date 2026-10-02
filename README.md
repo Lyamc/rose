@@ -64,7 +64,7 @@ rose service uninstall
 - Adds an inbound UDP firewall rule named `RoSE` for the listen port. QUIC is UDP; a TCP rule does not open the server.
 - Starts the service after the socket is bound.
 
-Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each client certificate in `%ProgramData%\RoSE\authorized_certs\`. `--listen` and `--hostname` match `rose server`.
+Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each DER client certificate (`client.crt.der` from `rose keygen`) in `%ProgramData%\RoSE\authorized_certs\` and name it with a `.crt` suffix. The service listens when that directory is empty and refuses every client until a certificate is added and the service is restarted. `--listen` and `--hostname` match `rose server`.
 
 `uninstall` stops the service, deletes the `RoSE` firewall rule, and removes `%ProgramFiles%\RoSE`. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
 
@@ -103,7 +103,7 @@ services.rose.enable = true;
 services.rose.openFirewall = true;
 ```
 
-`hostnames` is written into the server certificate on first start. Delete `server.crt` and `server.key` in the config directory before restarting if that list changes. Files in `authorizedCerts` must be DER-encoded. `rose keygen` writes that encoding to `client.crt.der`. The server only loads files in `authorized_certs/` whose names end in `.crt`.
+`hostnames` is written into the server certificate on first start. Delete `server.crt` and `server.key` in the config directory before restarting if that list changes. Files in `authorizedCerts` must be DER-encoded. `rose keygen` writes that encoding to `client.crt.der`. The server only loads files in `authorized_certs/` whose names end in `.crt`. It listens when that directory is empty and refuses every client until a certificate is added and the service is restarted.
 
 ### SSH bootstrap mode
 
