@@ -68,6 +68,43 @@ Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE
 
 `uninstall` stops the service, deletes the `RoSE` firewall rule, and removes `%ProgramFiles%\RoSE`. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
 
+### NixOS
+
+This repository is a flake. The NixOS module builds `rose` and runs it as a systemd service. `services.rose.openFirewall` opens the QUIC UDP port (4433 by default). Sessions run as `services.rose.user`. That is a `rose` system account unless you point it at an existing user. Certificates, `config.toml`, and `authorized_certs/` are stored in that account's `$HOME/.config/rose` (`/var/lib/rose/.config/rose` for the default account).
+
+```nix
+{
+  inputs.rose.url = "github:Lyamc/rose";
+
+  outputs = { nixpkgs, rose, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      modules = [
+        rose.nixosModules.default
+        {
+          services.rose = {
+            enable = true;
+            openFirewall = true;
+            hostnames = [ "shell.example.com" ];
+            authorizedCerts = [ ./clients/alice.crt ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+A configuration without a flake can import the module by path:
+
+```nix
+imports = [ /path/to/rose/nix/module.nix ];
+
+services.rose.enable = true;
+services.rose.openFirewall = true;
+```
+
+`hostnames` is written into the server certificate on first start. Delete `server.crt` and `server.key` in the config directory before restarting if that list changes. Files in `authorizedCerts` must be DER-encoded. `rose keygen` writes that encoding to `client.crt.der`. The server only loads files in `authorized_certs/` whose names end in `.crt`.
+
 ### SSH bootstrap mode
 
 No server daemon is required. RoSE SSHs in, starts a temporary server, exchanges certificates, and switches to QUIC:
