@@ -18,28 +18,65 @@ Early development. The core is functional — terminal emulation, PTY management
 
 ## Usage
 
-### Native Mode
+Build the `rose` binary, then either run the server in the foreground or, on Windows, install it as a service.
 
-Both client and server run persistent RoSE daemons. Authentication uses mutual TLS with X.509 certificates:
+```sh
+cargo build
+```
 
-1. `rose keygen` generates a client certificate
-2. Copy the certificate to `~/.config/rose/authorized_certs/` on the server
-3. For self-signed server certificates, the client uses TOFU (trust on first use) via `~/.config/rose/known_hosts/`
-4. For servers behind a reverse proxy with real TLS certificates, no TOFU is needed
+### Run the server
+
+Native mode keeps a RoSE daemon listening for QUIC on UDP port 4433.
+
+```sh
+rose server
+rose server --listen 0.0.0.0:4433 --hostname myserver.example.com
+```
+
+On first start the server writes a self-signed certificate under the config directory. Authentication is mutual TLS:
+
+1. `rose keygen` generates a client certificate.
+2. Copy that certificate into the server's `authorized_certs/` directory.
+3. For a self-signed server certificate, the client trusts it on first use and caches it in `known_hosts/`.
+4. A server behind a reverse proxy with a CA-signed certificate does not need that cache.
+
+Unix config lives in `~/.config/rose/`. The Windows service uses `%ProgramData%\RoSE\` instead, because it runs as LocalSystem and has no user home directory.
 
 ```sh
 rose connect myserver.example.com
+rose connect myserver.example.com --port 4433
 ```
 
-### SSH Bootstrap Mode
+### Windows service
 
-No server daemon required. RoSE SSHs in, starts a temporary server, exchanges certificates, and switches to QUIC — all in one step:
+From an elevated prompt, install the server so it starts at boot. This copies the binary you just built, registers the service, and opens the listen port in Windows Firewall.
+
+```sh
+rose service install
+rose service install --listen 0.0.0.0:4433 --hostname myserver.example.com
+rose service uninstall
+```
+
+`install` does all of the following:
+
+- Copies `rose.exe` to `%ProgramFiles%\RoSE\rose.exe`.
+- Registers an auto-start service named `RoSE`. The service account is LocalSystem, so every connected shell runs as LocalSystem. Windows restarts the service up to three times if it crashes.
+- Adds an inbound UDP firewall rule named `RoSE` for the listen port. QUIC is UDP; a TCP rule does not open the server.
+- Starts the service after the socket is bound.
+
+Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each client certificate in `%ProgramData%\RoSE\authorized_certs\`. `--listen` and `--hostname` match `rose server`.
+
+`uninstall` stops the service, deletes the `RoSE` firewall rule, and removes `%ProgramFiles%\RoSE`. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
+
+### SSH bootstrap mode
+
+No server daemon is required. RoSE SSHs in, starts a temporary server, exchanges certificates, and switches to QUIC:
 
 ```sh
 rose connect --ssh user@myserver.example.com
 ```
 
-### Escape Sequences
+### Escape sequences
 
 While connected, press `Enter` then `~` to access escape commands:
 
@@ -48,14 +85,7 @@ While connected, press `Enter` then `~` to access escape commands:
 - `~~` — send a literal `~`
 - `~?` — show help
 
-The reattach command includes `--session <id>` and preserves the host, port,
-and any explicit certificate paths. Run that command to resume the saved shell.
-
-## Building
-
-```sh
-cargo build
-```
+The reattach command includes `--session <id>` and preserves the host, port, and any explicit certificate paths. Run that command to resume the saved shell.
 
 ## Development
 
@@ -77,7 +107,7 @@ See [`doc/spec.md`](doc/spec.md) for the full specification.
 RoSE is a Cargo workspace with two crates:
 
 - **`lib/`** — library crate (`rose`) containing core logic: terminal emulation, state synchronization protocol (SSP), QUIC transport, PTY management, scrollback sync, and session persistence.
-- **`cli/`** — binary crate (`rose-cli`, binary name `rose`) providing subcommands: `connect`, `server`, `keygen`. Man pages are generated at build time.
+- **`cli/`** — binary crate (`rose-cli`, binary name `rose`) providing subcommands: `connect`, `server`, `keygen`, and `service`. Man pages are generated at build time.
 
 Key dependencies: [quinn](https://github.com/quinn-rs/quinn) (QUIC), [wezterm-term](https://github.com/wez/wezterm) (terminal emulation), [portable-pty](https://docs.rs/portable-pty) (PTY management), [rustls](https://github.com/rustls/rustls) (TLS 1.3), [rcgen](https://github.com/rustls/rcgen) (certificate generation).
 

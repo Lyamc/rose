@@ -68,6 +68,43 @@ enum Commands {
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
+    /// Install or remove the Windows service and its firewall rule.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+/// Windows service lifecycle commands.
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Copy `rose`, register the auto-start service, and allow its UDP port.
+    Install {
+        /// Address the service listens on.
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+
+        /// Hostnames to include in the server certificate's Subject Alternative Names.
+        #[arg(long)]
+        hostname: Vec<String>,
+    },
+    /// Stop the service, remove the firewall rule, and delete the installed binary.
+    Uninstall,
+    /// Service Control Manager entry point.
+    #[command(hide = true)]
+    Run {
+        /// Address the service listens on.
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+
+        /// Hostnames to include in the server certificate's Subject Alternative Names.
+        #[arg(long)]
+        hostname: Vec<String>,
+
+        /// Directory for the service certificate, config, and log.
+        #[arg(long)]
+        config_dir: PathBuf,
+    },
 }
 
 fn main() -> std::io::Result<()> {

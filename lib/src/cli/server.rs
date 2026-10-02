@@ -58,6 +58,33 @@ pub(super) async fn run_server(
     bootstrap: bool,
     hostname: Vec<String>,
 ) -> anyhow::Result<()> {
+    run_server_at(
+        listen,
+        bootstrap,
+        hostname,
+        RosePaths::resolve(),
+        None,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Runs the server using `paths` for certificates and configuration.
+///
+/// `on_listening` runs after the socket is bound. `shutdown` ends the accept
+/// loop; bootstrap mode ignores it and keeps its own idle timeout.
+///
+/// COVERAGE: CLI server loop is tested via integration/e2e tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(super) async fn run_server_at(
+    listen: SocketAddr,
+    bootstrap: bool,
+    hostname: Vec<String>,
+    paths: RosePaths,
+    mut on_listening: Option<Box<dyn FnOnce() + Send>>,
+    shutdown: impl Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
+    tokio::pin!(shutdown);
     let server = if bootstrap {
         use std::io::BufRead;
 
@@ -68,7 +95,6 @@ pub(super) async fn run_server(
             .map_err(|e| anyhow::anyhow!("failed to read client cert from stdin: {e}"))?;
         let client_cert_der = hex_decode(client_cert_hex.trim())?;
 
-        let paths = RosePaths::resolve();
         std::fs::create_dir_all(&paths.config_dir)?;
         let cert_path = paths.config_dir.join("server.crt");
         let key_path = paths.config_dir.join("server.key");
@@ -125,7 +151,6 @@ pub(super) async fn run_server(
 
         server
     } else {
-        let paths = RosePaths::resolve();
         std::fs::create_dir_all(&paths.config_dir)?;
         let cert_path = paths.config_dir.join("server.crt");
         let key_path = paths.config_dir.join("server.key");
@@ -163,9 +188,12 @@ pub(super) async fn run_server(
         eprintln!("RoSE server listening on {addr}");
     }
 
+    if let Some(callback) = on_listening.take() {
+        callback();
+    }
+
     let store = SessionStore::new();
-    let rose_config =
-        config::RoseConfig::load(&RosePaths::resolve().config_dir).unwrap_or_default();
+    let rose_config = config::RoseConfig::load(&paths.config_dir).unwrap_or_default();
     let max_sessions = rose_config.max_sessions;
     let idle_timeout = rose_config
         .session_idle_timeout_secs
@@ -190,16 +218,23 @@ pub(super) async fn run_server(
     }
 
     loop {
-        let incoming = if bootstrap
-            && store.is_empty()
-            && let Some(timeout) = store.final_screen_timeout()
-        {
-            match tokio::time::timeout(timeout, server.accept()).await {
-                Ok(result) => result,
-                Err(_) => break,
+        let incoming = if bootstrap {
+            if store.is_empty()
+                && let Some(timeout) = store.final_screen_timeout()
+            {
+                match tokio::time::timeout(timeout, server.accept()).await {
+                    Ok(result) => result,
+                    Err(_) => break,
+                }
+            } else {
+                server.accept().await
             }
         } else {
-            server.accept().await
+            tokio::select! {
+                biased;
+                () = &mut shutdown => break,
+                result = server.accept() => result,
+            }
         };
         let conn = match incoming {
             Ok(Some(conn)) => conn,

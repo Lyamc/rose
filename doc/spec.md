@@ -13,8 +13,9 @@ RoSE is a single binary (`rose`) with subcommands:
 - `rose connect <host>` — connect to a remote host
 - `rose server` — run the server daemon (native mode)
 - `rose keygen` — generate X.509 client certificates
+- `rose service install` / `rose service uninstall` — on Windows, register or remove the server as an auto-start service and its inbound UDP firewall rule
 
-Man pages are generated at build time via `clap_mangen` (`rose.1`, `rose-connect.1`, `rose-server.1`, `rose-keygen.1`). Shell aliases (e.g., `alias rose-server='rose server'`) can be created by users if desired.
+Man pages are generated at build time via `clap_mangen` (`rose.1`, `rose-connect.1`, `rose-server.1`, `rose-keygen.1`, `rose-service.1`). Shell aliases (e.g., `alias rose-server='rose server'`) can be created by users if desired.
 
 ### Terminal Emulator
 

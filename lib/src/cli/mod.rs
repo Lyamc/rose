@@ -8,6 +8,7 @@ mod client;
 mod input;
 mod keygen;
 mod server;
+mod service;
 mod ssh_bootstrap;
 mod util;
 
@@ -89,6 +90,43 @@ enum Commands {
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
+    /// Install or remove the Windows service and its firewall rule.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+/// Windows service lifecycle commands.
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Copy `rose`, register the auto-start service, and allow its UDP port.
+    Install {
+        /// Address the service listens on.
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+
+        /// Hostnames to include in the server certificate's Subject Alternative Names.
+        #[arg(long)]
+        hostname: Vec<String>,
+    },
+    /// Stop the service, remove the firewall rule, and delete the installed binary.
+    Uninstall,
+    /// Service Control Manager entry point.
+    #[command(hide = true)]
+    Run {
+        /// Address the service listens on.
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        listen: SocketAddr,
+
+        /// Hostnames to include in the server certificate's Subject Alternative Names.
+        #[arg(long)]
+        hostname: Vec<String>,
+
+        /// Directory for the service certificate, config, and log.
+        #[arg(long)]
+        config_dir: PathBuf,
+    },
 }
 
 fn parse_session_id(value: &str) -> Result<[u8; 16], String> {
@@ -101,10 +139,41 @@ fn parse_session_id(value: &str) -> Result<[u8; 16], String> {
         .map_err(|_| "session ID must contain 32 hexadecimal digits".into())
 }
 
+/// Starts the Windows service dispatcher on this thread.
+///
+/// The binary calls this from `main` before starting tokio. Windows requires
+/// the service control dispatcher on the process main thread.
+///
+/// # Errors
+///
+/// Returns an error when the arguments are not `service run`, or when the
+/// Service Control Manager rejects the process.
+///
+/// COVERAGE: CLI entry point; the dispatcher requires the Service Control Manager.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn run_service() -> anyhow::Result<()> {
+    init_tracing(service::service_log_path(
+        &std::env::args().collect::<Vec<_>>(),
+    ));
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Service {
+            action:
+                ServiceAction::Run {
+                    listen,
+                    hostname,
+                    config_dir,
+                },
+        } => service::run(listen, hostname, config_dir),
+        _ => anyhow::bail!("rose service run was invoked with unexpected arguments"),
+    }
+}
+
 /// Parses CLI arguments and runs the appropriate subcommand.
 ///
 /// This is the main entry point for the `rose` binary. Call this from
-/// a `#[tokio::main]` function.
+/// a `#[tokio::main]` function. `service run` is the exception: call
+/// [`run_service`] from `main` so the dispatcher stays on the main thread.
 ///
 /// # Errors
 ///
@@ -113,12 +182,9 @@ fn parse_session_id(value: &str) -> Result<[u8; 16], String> {
 /// COVERAGE: CLI entry point; logic tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn run() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
-        )
-        .init();
+    init_tracing(service::service_log_path(
+        &std::env::args().collect::<Vec<_>>(),
+    ));
 
     let cli = Cli::parse();
 
@@ -154,7 +220,38 @@ pub async fn run() -> anyhow::Result<()> {
             hostname,
         } => server::run_server(listen, bootstrap, hostname).await,
         Commands::Keygen => keygen::run_keygen(),
+        Commands::Service { action } => match action {
+            ServiceAction::Install { listen, hostname } => service::install(listen, hostname),
+            ServiceAction::Uninstall => service::uninstall(),
+            ServiceAction::Run {
+                listen,
+                hostname,
+                config_dir,
+            } => service::run(listen, hostname, config_dir),
+        },
     }
+}
+
+fn init_tracing(log_file: Option<PathBuf>) {
+    let default_filter = if log_file.is_some() { "info" } else { "error" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    if let Some(path) = log_file
+        && let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        return;
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 #[cfg(test)]
@@ -206,5 +303,35 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_service_install_and_uninstall() {
+        let install = Cli::try_parse_from([
+            "rose",
+            "service",
+            "install",
+            "--listen",
+            "192.0.2.10:4433",
+            "--hostname",
+            "rose.example",
+        ])
+        .unwrap();
+        let Commands::Service { action } = install.command else {
+            panic!("expected service");
+        };
+        let ServiceAction::Install { listen, hostname } = action else {
+            panic!("expected install");
+        };
+        assert_eq!(listen, "192.0.2.10:4433".parse().unwrap());
+        assert_eq!(hostname, vec!["rose.example".to_string()]);
+
+        let uninstall = Cli::try_parse_from(["rose", "service", "uninstall"]).unwrap();
+        assert!(matches!(
+            uninstall.command,
+            Commands::Service {
+                action: ServiceAction::Uninstall
+            }
+        ));
     }
 }
