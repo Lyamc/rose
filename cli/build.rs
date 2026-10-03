@@ -78,7 +78,7 @@ enum Commands {
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
-    /// Install or remove the Windows service and its firewall rule.
+    /// Install or remove the Windows service, its firewall rule, and its system PATH entry.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -130,7 +130,7 @@ enum TotpAction {
 /// Windows service lifecycle commands.
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Copy `rose`, register the auto-start service, and allow its UDP port.
+    /// Copy `rose`, register the auto-start service, allow its UDP port, and add it to the system PATH.
     Install {
         /// Address the service listens on.
         #[arg(long, default_value = "0.0.0.0:4433")]
@@ -140,7 +140,7 @@ enum ServiceAction {
         #[arg(long)]
         hostname: Vec<String>,
     },
-    /// Stop the service, remove the firewall rule, and delete the installed binary.
+    /// Stop the service, remove the firewall rule and system PATH entry, and delete the installed binary.
     Uninstall,
     /// Service Control Manager entry point.
     #[command(hide = true)]

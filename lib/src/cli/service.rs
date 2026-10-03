@@ -1,9 +1,10 @@
 //! Install and remove the `RoSE` server as a Windows service.
 //!
 //! `rose service install` copies this binary, registers an auto-start service,
-//! and adds an inbound UDP firewall rule for the listen port. `rose service
-//! uninstall` stops the service, deletes that rule, and removes the copied
-//! binary. Configuration under the service data directory is left in place.
+//! adds an inbound UDP firewall rule for the listen port, and puts the install
+//! directory on the machine `PATH`. `rose service uninstall` stops the service,
+//! deletes that rule, removes the `PATH` entry, and removes the copied binary.
+//! Configuration under the service data directory is left in place.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -163,10 +164,83 @@ pub(super) fn firewall_remove_script() -> String {
 #[must_use]
 pub(super) fn uninstall_summary(layout: &ServiceLayout) -> String {
     format!(
-        "Removed the {SERVICE_DISPLAY_NAME} service, its firewall rule, and {}.\nLeft configuration in place at {}.",
+        "Removed the {SERVICE_DISPLAY_NAME} service, its firewall rule, its system PATH entry, and {}.\nLeft configuration in place at {}.",
         layout.install_dir.display(),
         layout.config_dir.display(),
     )
+}
+
+/// Adds `dir` to a Windows `PATH` value.
+///
+/// Returns `None` when `dir` is empty or already present. Matching ignores ASCII case,
+/// quotes, slash direction, and a trailing separator.
+#[must_use]
+pub(super) fn insert_path_dir(path: &str, dir: &str) -> Option<String> {
+    let key = path_entry_key(dir);
+    if key.is_empty() || path.split(';').any(|entry| path_entry_key(entry) == key) {
+        return None;
+    }
+    let dir = dir.trim().trim_end_matches(['\\', '/']);
+    let base = path.trim_end_matches(';');
+    if base.is_empty() {
+        Some(dir.to_string())
+    } else {
+        Some(format!("{base};{dir}"))
+    }
+}
+
+/// Removes every entry that names `dir` from a Windows `PATH` value.
+///
+/// Returns `None` when `dir` is absent. Entries that remain keep their original spelling,
+/// including unexpanded variables such as `%SystemRoot%`.
+#[must_use]
+pub(super) fn remove_path_dir(path: &str, dir: &str) -> Option<String> {
+    let key = path_entry_key(dir);
+    if key.is_empty() {
+        return None;
+    }
+    let mut removed = false;
+    let mut kept = Vec::new();
+    for entry in path.split(';') {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        if path_entry_key(entry) == key {
+            removed = true;
+        } else {
+            kept.push(entry);
+        }
+    }
+    removed.then(|| kept.join(";"))
+}
+
+/// PowerShell that broadcasts `WM_SETTINGCHANGE` so new processes see an updated `PATH`.
+///
+/// `HWND_BROADCAST` is `0xffff`, `WM_SETTINGCHANGE` is `0x1A`, and `SMTO_ABORTIFHUNG` is `2`.
+/// The timeout keeps a hung window from stalling install or uninstall.
+#[must_use]
+pub(super) const fn environment_change_script() -> &'static str {
+    r#"$signature = @'
+using System;
+using System.Runtime.InteropServices;
+public static class RoseEnvironmentNotify {
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);
+}
+'@
+Add-Type -TypeDefinition $signature
+$result = [UIntPtr]::Zero
+[void][RoseEnvironmentNotify]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)"#
+}
+
+/// Comparison key for one Windows `PATH` entry.
+fn path_entry_key(entry: &str) -> String {
+    entry
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 /// Installs the Windows service and its firewall rule.
@@ -258,12 +332,15 @@ fn install_summary(layout: &ServiceLayout, listen: SocketAddr) -> String {
     format!(
         "Installed the {SERVICE_DISPLAY_NAME} service.\n\
          Binary: {}\n\
+         System PATH: {}\n\
          Listen: {listen} (UDP)\n\
          Firewall rule: {FIREWALL_RULE_DISPLAY} ({FIREWALL_RULE_NAME})\n\
          Config: {}\n\
          The service account is LocalSystem, and the service starts automatically.\n\
+         Open a new terminal to pick up the PATH change.\n\
          Place client certificates in {}.",
         layout.executable.display(),
+        layout.install_dir.display(),
         layout.config_dir.display(),
         layout.config_dir.join("authorized_certs").display(),
     )
@@ -307,8 +384,9 @@ mod windows {
     use super::{
         ERROR_ACCESS_DENIED, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_SERVICE_DOES_NOT_EXIST,
         ERROR_SERVICE_NOT_ACTIVE, EXECUTABLE_NAME, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME,
-        SERVICE_NAME, ServiceLayout, firewall_remove_script, prepare_install, service_failure_args,
-        service_layout, uninstall_summary,
+        SERVICE_NAME, ServiceLayout, environment_change_script, firewall_remove_script,
+        insert_path_dir, prepare_install, remove_path_dir, service_failure_args, service_layout,
+        uninstall_summary,
     };
     use crate::cli::server::run_server_at;
     use crate::config::RosePaths;
@@ -340,6 +418,7 @@ mod windows {
 
         create_service(&plan.layout.executable, &plan.launch_arguments)?;
         run_powershell(&plan.firewall_script, "add the RoSE firewall rule")?;
+        update_system_path(&plan.layout.install_dir, true)?;
         configure_restart()?;
         start_service()?;
         eprintln!("{}", plan.summary);
@@ -352,9 +431,61 @@ mod windows {
         let layout = service_layout(&program_files, &program_data);
         remove_service()?;
         run_powershell(&firewall_remove_script(), "remove the RoSE firewall rule")?;
-        remove_installed_files(&layout)?;
+        let path_result = update_system_path(&layout.install_dir, false);
+        let files_result = remove_installed_files(&layout);
+        path_result.and(files_result)?;
         eprintln!("{}", uninstall_summary(&layout));
         Ok(())
+    }
+
+    /// Inserts or removes the install directory on the machine `PATH`.
+    ///
+    /// The value is read and written unexpanded, and its registry type (`REG_SZ` or
+    /// `REG_EXPAND_SZ`) is preserved. Writing through the process environment would expand
+    /// `%SystemRoot%` and could store the result as a plain string.
+    fn update_system_path(install_dir: &std::path::Path, include: bool) -> anyhow::Result<()> {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ};
+        use winreg::types::{FromRegValue, ToRegValue};
+
+        let environment = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(
+                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                KEY_READ | KEY_SET_VALUE,
+            )
+            .map_err(|error| io_error(error, "open the system PATH registry key"))?;
+        let (path, value_type) = match environment.get_raw_value("Path") {
+            Ok(value) => {
+                if !matches!(value.vtype, REG_SZ | REG_EXPAND_SZ) {
+                    anyhow::bail!("the system PATH registry value is not a string");
+                }
+                let path = String::from_reg_value(&value)
+                    .map_err(|error| io_error(error, "decode the system PATH"))?;
+                (path, value.vtype)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (String::new(), REG_EXPAND_SZ)
+            }
+            Err(error) => return Err(io_error(error, "read the system PATH")),
+        };
+        let dir = install_dir.display().to_string();
+        let updated = if include {
+            insert_path_dir(&path, &dir)
+        } else {
+            remove_path_dir(&path, &dir)
+        };
+        let Some(updated) = updated else {
+            return Ok(());
+        };
+        let mut written = updated.to_reg_value();
+        written.vtype = value_type;
+        environment
+            .set_raw_value("Path", &written)
+            .map_err(|error| io_error(error, "update the system PATH"))?;
+        run_powershell(
+            environment_change_script(),
+            "notify Windows that the system PATH changed",
+        )
     }
 
     pub(super) fn run(
@@ -784,6 +915,10 @@ mod tests {
         assert!(plan.summary.contains("UDP"));
         assert!(plan.summary.contains("LocalSystem"));
         assert!(plan.summary.contains("authorized_certs"));
+        assert!(plan.summary.contains(&format!(
+            "System PATH: {}",
+            Path::new(r"C:\Program Files").join("RoSE").display()
+        )));
     }
 
     #[test]
@@ -849,6 +984,57 @@ mod tests {
                     .to_string()
             )
         );
+        assert!(summary.contains("system PATH"));
+    }
+
+    #[test]
+    fn system_path_gains_the_install_directory_once() {
+        let original = r"%SystemRoot%\system32;C:\Windows";
+        let updated = insert_path_dir(original, r"C:\Program Files\RoSE").unwrap();
+        assert_eq!(
+            updated,
+            r"%SystemRoot%\system32;C:\Windows;C:\Program Files\RoSE"
+        );
+        assert_eq!(insert_path_dir(&updated, r"c:\program files\rose\"), None);
+        assert_eq!(
+            insert_path_dir(&updated, r#""C:\Program Files\RoSE""#),
+            None
+        );
+        assert!(
+            insert_path_dir(r"C:\Program Files\RoSE-tools", r"C:\Program Files\RoSE").is_some()
+        );
+        assert_eq!(
+            insert_path_dir(";", r"C:\Program Files\RoSE").as_deref(),
+            Some(r"C:\Program Files\RoSE")
+        );
+        assert_eq!(insert_path_dir(original, "   "), None);
+    }
+
+    #[test]
+    fn system_path_loses_only_the_install_directory() {
+        let original = r"%SystemRoot%\system32;C:\Program Files\RoSE;C:\Windows";
+        assert_eq!(
+            remove_path_dir(original, r"C:/Program Files/RoSE/").as_deref(),
+            Some(r"%SystemRoot%\system32;C:\Windows")
+        );
+        assert_eq!(remove_path_dir(original, r"C:\Windows\System32"), None);
+        assert_eq!(
+            remove_path_dir(
+                r#""C:\Program Files\RoSE";C:\Program Files\RoSE;"#,
+                r"C:\Program Files\RoSE"
+            )
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn environment_change_notifies_running_processes() {
+        let script = environment_change_script();
+        assert!(script.contains("SendMessageTimeout"));
+        assert!(script.contains("0xffff"));
+        assert!(script.contains("0x1A"));
+        assert!(script.contains("'Environment'"));
     }
 
     #[test]

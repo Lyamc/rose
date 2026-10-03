@@ -85,7 +85,7 @@ set in `config.toml` as `always_retry`, `retry_limit`, and
 
 ### Windows service
 
-From an elevated prompt, install the server so it starts at boot. This copies the binary you just built, registers the service, and opens the listen port in Windows Firewall.
+From an elevated prompt, install the server so it starts at boot. This copies the binary you just built, registers the service, opens the listen port in Windows Firewall, and adds the install directory to the system `PATH`. Open a new terminal before running `rose`.
 
 ```sh
 rose service install
@@ -98,11 +98,12 @@ rose service uninstall
 - Copies `rose.exe` to `%ProgramFiles%\RoSE\rose.exe`.
 - Registers an auto-start service named `RoSE`. The service account is LocalSystem, so every connected shell runs as LocalSystem. Windows restarts the service up to three times if it crashes.
 - Adds an inbound UDP firewall rule named `RoSE` for the listen port. QUIC is UDP; a TCP rule does not open the server.
+- Adds `%ProgramFiles%\RoSE` to the system `PATH` when that directory is not already there. The registry value keeps its existing type, so entries such as `%SystemRoot%\system32` stay unexpanded. Terminals that are already open keep their old `PATH` until they are started again.
 - Starts the service after the socket is bound.
 
 Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each DER client certificate (`client.crt.der` from `rose keygen`) in `%ProgramData%\RoSE\authorized_certs\` and name it with a `.crt` suffix, or use `rose ctl authorize`. `rose ctl` finds that directory by default on Windows. The service listens when that directory is empty and refuses every client until a matching `.crt` is present, unless `require_client_certs` is `false`. Adding or removing a certificate, and `rose ctl set`, take effect immediately; a restart is not required. `--listen` and `--hostname` match `rose server`. A portable layout is a `rose.exe` with `config.toml` beside it; that directory is used instead of `%ProgramData%\RoSE`.
 
-`uninstall` stops the service, deletes the `RoSE` firewall rule, and removes `%ProgramFiles%\RoSE`. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
+`uninstall` stops the service, deletes the `RoSE` firewall rule, removes `%ProgramFiles%\RoSE` from the system `PATH`, and deletes that directory. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
 
 ### NixOS
 

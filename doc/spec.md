@@ -14,7 +14,7 @@ RoSE is a single binary (`rose`) with subcommands:
 - `rose server` — run the server daemon (native mode)
 - `rose ctl` — show or change persistent server settings (`config.toml`, `authorized_certs/`) without restarting. Config is `config.toml` next to the executable when present, otherwise `%ProgramData%\RoSE` on Windows or `~/.config/rose` on Unix.
 - `rose keygen` — generate X.509 client certificates
-- `rose service install` / `rose service uninstall` — on Windows, register or remove the server as an auto-start service and its inbound UDP firewall rule
+- `rose service install` / `rose service uninstall` — on Windows, register or remove the server as an auto-start service, its inbound UDP firewall rule, and its system `PATH` entry
 
 Man pages are generated at build time via `clap_mangen` (`rose.1`, `rose-connect.1`, `rose-server.1`, `rose-ctl.1`, `rose-keygen.1`, `rose-service.1`). Shell aliases (e.g., `alias rose-server='rose server'`, `alias rosectl='rose ctl'`) can be created by users if desired.
 
