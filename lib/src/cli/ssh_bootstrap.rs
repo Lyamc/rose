@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::client::{
     StunReconnectContext, client_session_loop_with_client, client_session_loop_with_conn,
 };
+use super::retry::RetryFlags;
 use super::util::{RawModeGuard, hex_encode, load_or_generate_client_cert, parse_bootstrap_line};
 use crate::config::{self, RosePaths};
 use crate::transport::QuicClient;
@@ -28,6 +29,7 @@ pub(super) async fn run_ssh_bootstrap(
     force_stun: bool,
     ssh_port: Option<u16>,
     ssh_options: &[String],
+    retry_flags: RetryFlags,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -107,6 +109,7 @@ pub(super) async fn run_ssh_bootstrap(
 
     let paths = RosePaths::resolve();
     let cfg = config::RoseConfig::load(&paths.config_dir)?;
+    let retry = retry_flags.resolve(&cfg);
     std::fs::create_dir_all(&paths.known_hosts_dir)?;
     std::fs::write(
         paths.known_hosts_dir.join(format!("{}.crt", addr.ip())),
@@ -201,10 +204,11 @@ pub(super) async fn run_ssh_bootstrap(
             StunReconnectContext {
                 stun_servers: cfg.stun_servers.clone(),
             },
+            retry,
         )
         .await
     } else if let Some(Ok(Ok((_client, conn)))) = direct_result {
-        client_session_loop_with_conn(conn, addr, &resolved_host, client_config).await
+        client_session_loop_with_conn(conn, addr, &resolved_host, client_config, retry).await
     } else {
         unreachable!()
     }

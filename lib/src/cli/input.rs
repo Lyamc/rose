@@ -148,6 +148,35 @@ impl KeyboardInput {
             consumed = true;
         }
     }
+
+    /// Reads a line of typed characters (for TOTP) without sending them to the PTY.
+    ///
+    /// COVERAGE: Requires a real keyboard event stream.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) async fn read_prompt_line(&self) -> anyhow::Result<String> {
+        let mut events = self.events.lock().await;
+        let mut line = String::new();
+        loop {
+            match events.recv().await {
+                Some(Event::Key(key))
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    match key.code {
+                        KeyCode::Enter => return Ok(line),
+                        KeyCode::Backspace => {
+                            line.pop();
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            line.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+                Some(_) => {}
+                None => anyhow::bail!("input closed"),
+            }
+        }
+    }
 }
 
 fn process_key(key: &KeyEvent, state: &mut KeyboardState) -> Option<InputAction> {

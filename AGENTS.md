@@ -144,7 +144,7 @@ RoSE (Remote Shell Environment) is a Mosh-inspired remote terminal over QUIC. Se
 This is a Cargo workspace with two crates:
 
 - `lib/` — library crate (`rose`) containing core logic (terminal emulation via wezterm, state synchronization protocol, QUIC transport via quinn, PTY management via portable-pty). Uses `thiserror` for errors and `tracing` for instrumentation.
-- `cli/` — binary crate (`rose-cli`, binary name `rose`) providing subcommands: `connect`, `server`, `keygen`, and `service` (Windows install/uninstall). Uses `tokio`, `anyhow`, `clap`, and `tracing-subscriber`.
+- `cli/` — binary crate (`rose-cli`, binary name `rose`) providing subcommands: `connect`, `server`, `ctl`, `keygen`, and `service` (Windows install/uninstall). Uses `tokio`, `anyhow`, `clap`, and `tracing-subscriber`.
 
 # Code Review Checklist
 

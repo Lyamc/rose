@@ -5,8 +5,10 @@
 //! [`run`].
 
 mod client;
+mod ctl;
 mod input;
 mod keygen;
+mod retry;
 mod server;
 mod service;
 mod ssh_bootstrap;
@@ -70,6 +72,21 @@ enum Commands {
         /// Used for reattaching to a bootstrapped session after detach.
         #[arg(long)]
         client_cert: Option<PathBuf>,
+
+        /// Keep retrying even when the server is listening and rejecting this
+        /// client (unauthorized or missing certificate, TLS alert).
+        #[arg(long)]
+        always_retry: bool,
+
+        /// Maximum initial connection attempts. `-1` retries indefinitely.
+        /// Defaults to 10, or `retry_limit` in `config.toml`.
+        #[arg(long, allow_hyphen_values = true)]
+        retry_limit: Option<i64>,
+
+        /// Seconds to wait between retries. When omitted, delays follow
+        /// 1, 2, 3, 5, 5, 5, 10, 10, 10, 30, 60, 120, ... up to one hour.
+        #[arg(long, value_name = "SECONDS")]
+        retry_interval: Option<u64>,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -87,6 +104,20 @@ enum Commands {
         /// TLS hostname verification in native mode.
         #[arg(long)]
         hostname: Vec<String>,
+    },
+    /// Inspect or change the persistent server configuration.
+    ///
+    /// Writes `config.toml` and `authorized_certs/`. Pairing uses
+    /// `pending` / `approve` / `deny`. A running server applies those files
+    /// without a restart.
+    Ctl {
+        /// Config directory. Defaults to `config.toml` next to this
+        /// executable, then `%ProgramData%\RoSE` on Windows or
+        /// `$HOME/.config/rose` on Unix.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<ctl::CtlAction>,
     },
     /// Generate X.509 client certificates for authentication.
     Keygen,
@@ -200,7 +231,15 @@ pub async fn run() -> anyhow::Result<()> {
             ssh_port,
             ssh_option,
             client_cert,
+            always_retry,
+            retry_limit,
+            retry_interval,
         } => {
+            let retry_flags = retry::RetryFlags {
+                always_retry,
+                retry_limit,
+                retry_interval,
+            };
             if ssh {
                 ssh_bootstrap::run_ssh_bootstrap(
                     &host,
@@ -208,10 +247,11 @@ pub async fn run() -> anyhow::Result<()> {
                     force_stun,
                     ssh_port,
                     &ssh_option,
+                    retry_flags,
                 )
                 .await
             } else {
-                client::run_client(&host, port, cert, client_cert, session).await
+                client::run_client(&host, port, cert, client_cert, session, retry_flags).await
             }
         }
         Commands::Server {
@@ -219,6 +259,7 @@ pub async fn run() -> anyhow::Result<()> {
             bootstrap,
             hostname,
         } => server::run_server(listen, bootstrap, hostname).await,
+        Commands::Ctl { config_dir, action } => ctl::run_ctl(config_dir, action),
         Commands::Keygen => keygen::run_keygen(),
         Commands::Service { action } => match action {
             ServiceAction::Install { listen, hostname } => service::install(listen, hostname),
@@ -303,6 +344,96 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_connect_retry_flags() {
+        let cli = Cli::try_parse_from([
+            "rose",
+            "connect",
+            "host",
+            "--always-retry",
+            "--retry-limit",
+            "-1",
+            "--retry-interval",
+            "15",
+        ])
+        .unwrap();
+        let Commands::Connect {
+            always_retry,
+            retry_limit,
+            retry_interval,
+            ..
+        } = cli.command
+        else {
+            panic!("expected connect");
+        };
+        assert!(always_retry);
+        assert_eq!(retry_limit, Some(-1));
+        assert_eq!(retry_interval, Some(15));
+    }
+
+    #[test]
+    fn parse_ctl_set_and_default_show() {
+        let show = Cli::try_parse_from(["rose", "ctl"]).unwrap();
+        let Commands::Ctl {
+            config_dir,
+            action: None,
+        } = show.command
+        else {
+            panic!("expected ctl with default show");
+        };
+        assert!(config_dir.is_none());
+
+        let set = Cli::try_parse_from([
+            "rose",
+            "ctl",
+            "--config-dir",
+            "/tmp/rose",
+            "set",
+            "require_client_certs",
+            "false",
+        ])
+        .unwrap();
+        let Commands::Ctl {
+            config_dir,
+            action: Some(ctl::CtlAction::Set { key, value }),
+        } = set.command
+        else {
+            panic!("expected ctl set");
+        };
+        assert_eq!(config_dir, Some(PathBuf::from("/tmp/rose")));
+        assert_eq!(key, "require_client_certs");
+        assert_eq!(value, "false");
+
+        let approve = Cli::try_parse_from(["rose", "ctl", "approve", "12345678"]).unwrap();
+        let Commands::Ctl {
+            action: Some(ctl::CtlAction::Approve { code, totp }),
+            ..
+        } = approve.command
+        else {
+            panic!("expected ctl approve");
+        };
+        assert_eq!(code, "12345678");
+        assert!(totp.is_none());
+        let pair = Cli::try_parse_from(["rose", "ctl", "pair", "44", "--totp", "123456"]).unwrap();
+        assert!(matches!(
+            pair.command,
+            Commands::Ctl {
+                action: Some(ctl::CtlAction::Approve { totp: Some(_), .. }),
+                ..
+            }
+        ));
+        let totp_init = Cli::try_parse_from(["rose", "ctl", "totp", "init"]).unwrap();
+        assert!(matches!(
+            totp_init.command,
+            Commands::Ctl {
+                action: Some(ctl::CtlAction::Totp {
+                    action: ctl::TotpAction::Init
+                }),
+                ..
+            }
+        ));
     }
 
     #[test]

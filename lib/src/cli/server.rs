@@ -9,13 +9,15 @@ use super::util::{
     FrameSendResult, SspFrameSender, extract_peer_cert, hex_decode, hex_encode, parse_stun_line,
     rand_session_id, rand_u16, write_private_key,
 };
-use crate::config::{self, CertKeyPair, RosePaths};
+use crate::config::{self, CertKeyPair, RoseConfig, RosePaths};
 use crate::protocol::{self, ControlMessage, ServerSession};
 use crate::pty::PtySession;
 use crate::scrollback::{self, ScrollbackSender};
 use crate::session::{DetachedSession, FinalCheckpoint, SessionStore};
+use crate::sso;
 use crate::ssp::{DATAGRAM_KEYSTROKE, DATAGRAM_SSP_ACK, SspFrame, SspSender};
 use crate::terminal::RoseTerminal;
+use crate::totp;
 use crate::transport::QuicServer;
 
 type SessionTuple = (
@@ -85,6 +87,7 @@ pub(super) async fn run_server_at(
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
+    let mut bootstrap_auth_dir = None;
     let server = if bootstrap {
         use std::io::BufRead;
 
@@ -129,7 +132,12 @@ pub(super) async fn run_server_at(
         for _ in 0..100 {
             let port = 60000 + (rand_u16() % 1000);
             let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-            match QuicServer::bind_mutual_tls(addr, server_cert.clone(), auth_dir.path()) {
+            match QuicServer::bind_mutual_tls(
+                addr,
+                server_cert.clone(),
+                auth_dir.path(),
+                &paths.config_dir,
+            ) {
                 Ok(s) => {
                     bound = Some(s);
                     break;
@@ -137,10 +145,11 @@ pub(super) async fn run_server_at(
                 Err(_) => continue,
             }
         }
-        drop(auth_dir);
-
         let server =
             bound.ok_or_else(|| anyhow::anyhow!("failed to bind to any port in 60000-61000"))?;
+        // Keep the bootstrap client cert on disk for the server lifetime so
+        // live authorization checks continue to accept this client.
+        bootstrap_auth_dir = Some(auth_dir);
 
         let addr = server.local_addr()?;
         let server_cert_hex = hex_encode(server.server_cert_der().as_ref());
@@ -179,8 +188,9 @@ pub(super) async fn run_server_at(
         };
 
         std::fs::create_dir_all(&paths.authorized_certs_dir)?;
-        QuicServer::bind_mutual_tls(listen, cert, &paths.authorized_certs_dir)?
+        QuicServer::bind_mutual_tls(listen, cert, &paths.authorized_certs_dir, &paths.config_dir)?
     };
+    let _bootstrap_auth_dir = bootstrap_auth_dir;
 
     let addr = server.local_addr()?;
 
@@ -193,11 +203,6 @@ pub(super) async fn run_server_at(
     }
 
     let store = SessionStore::new();
-    let rose_config = config::RoseConfig::load(&paths.config_dir).unwrap_or_default();
-    let max_sessions = rose_config.max_sessions;
-    let idle_timeout = rose_config
-        .session_idle_timeout_secs
-        .map(Duration::from_secs);
     let active_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     if bootstrap {
@@ -247,7 +252,11 @@ pub(super) async fn run_server_at(
         let peer = conn.remote_address();
         tracing::info!(%peer, "new connection");
 
-        if let Some(timeout) = idle_timeout {
+        let rose_config = config::RoseConfig::load(&paths.config_dir).unwrap_or_default();
+        if let Some(timeout) = rose_config
+            .session_idle_timeout_secs
+            .map(Duration::from_secs)
+        {
             let pruned = store.prune_idle(timeout);
             if pruned > 0 {
                 tracing::info!(pruned, "pruned idle detached sessions");
@@ -256,14 +265,14 @@ pub(super) async fn run_server_at(
         let _ = store.prune_exited();
 
         if bootstrap {
-            if let Err(e) = handle_server_session(conn, store.clone(), true).await {
+            if let Err(e) = handle_server_session(conn, store.clone(), true, paths.clone()).await {
                 tracing::error!(%peer, "session error: {e}");
             }
             if store.is_empty() && store.final_screen_timeout().is_none() {
                 break;
             }
         } else {
-            if let Some(limit) = max_sessions {
+            if let Some(limit) = rose_config.max_sessions {
                 let total =
                     active_sessions.load(std::sync::atomic::Ordering::Relaxed) + store.len();
                 if total >= limit {
@@ -273,10 +282,11 @@ pub(super) async fn run_server_at(
                 }
             }
             let store = store.clone();
+            let paths = paths.clone();
             let active = Arc::clone(&active_sessions);
             active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                if let Err(e) = handle_server_session(conn, store, false).await {
+                if let Err(e) = handle_server_session(conn, store, false, paths).await {
                     tracing::error!(%peer, "session error: {e}");
                 }
                 active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -384,15 +394,149 @@ async fn new_session(
     Ok((session_id, pty, terminal, ssp_sender, rows, cols))
 }
 
+/// Pairing, SSO, and TOTP after TLS. No PTY until this returns.
+///
+/// COVERAGE: Handshake is covered by protocol and pairing tests; this
+/// coordinates those pieces over a live session.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn complete_client_auth(
+    session: &mut ServerSession,
+    paths: &RosePaths,
+    peer_cert: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let cfg = RoseConfig::load(&paths.config_dir).unwrap_or_default();
+    if !cfg.require_client_certs {
+        return Ok(());
+    }
+    let Some(cert) = peer_cert else {
+        anyhow::bail!("client certificate required");
+    };
+    if !config::is_authorized_client_cert(&paths.authorized_certs_dir, cert) {
+        wait_for_client_authorization(session, paths, cert, &cfg).await?;
+    }
+    if cfg.totp_required {
+        complete_totp_challenge(session, paths, cert).await?;
+    }
+    Ok(())
+}
+
+/// Waits for `rose ctl approve` or a finished OIDC device login.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn wait_for_client_authorization(
+    session: &mut ServerSession,
+    paths: &RosePaths,
+    cert: &[u8],
+    cfg: &RoseConfig,
+) -> anyhow::Result<()> {
+    let pairing_code = cfg
+        .pairing
+        .then(|| config::record_pending_client_cert(&paths.config_dir, cert));
+    let sso_settings = cfg.sso_settings();
+    let device = match &sso_settings {
+        Some(settings) => match sso::start_device_login(settings).await {
+            Ok(auth) => Some(auth),
+            Err(error) => {
+                tracing::warn!(%error, "OIDC device login failed to start");
+                None
+            }
+        },
+        None => None,
+    };
+    if pairing_code.is_none() && device.is_none() {
+        anyhow::bail!("client certificate is not authorized");
+    }
+    let pairing_ttl = pairing_code
+        .as_ref()
+        .map_or(0, |code| config::pairing_ttl_secs(code.len() as u8));
+    let sso_ttl = device.as_ref().map_or(0, |auth| auth.expires_in);
+    let wait_secs = pairing_ttl.max(sso_ttl).max(15);
+    session
+        .send_control(&ControlMessage::AuthRequired {
+            pairing_code,
+            pairing_ttl_secs: u32::try_from(pairing_ttl).unwrap_or(u32::MAX),
+            sso_uri: device.as_ref().map(|auth| auth.verification_uri.clone()),
+            sso_user_code: device.as_ref().map(|auth| auth.user_code.clone()),
+        })
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+    let poll = Duration::from_secs(device.as_ref().map_or(1, |auth| auth.interval.max(1)));
+    loop {
+        if config::is_authorized_client_cert(&paths.authorized_certs_dir, cert) {
+            return Ok(());
+        }
+        if let (Some(settings), Some(auth)) = (sso_settings.as_ref(), device.as_ref()) {
+            match sso::try_poll_id_token(settings, auth).await {
+                Ok(Some(sub)) => {
+                    let name = config::sanitize_hostname(&sub);
+                    let name = if name.is_empty() {
+                        "sso".to_string()
+                    } else {
+                        name
+                    };
+                    std::fs::create_dir_all(&paths.authorized_certs_dir)?;
+                    std::fs::write(paths.authorized_certs_dir.join(format!("{name}.crt")), cert)?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, "OIDC token poll failed"),
+            }
+        }
+        if cfg.pairing && !config::has_pending_client_cert(&paths.config_dir, cert) {
+            anyhow::bail!("pairing code expired");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("authorization timed out");
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Enrolls or challenges the connecting client for TOTP.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn complete_totp_challenge(
+    session: &mut ServerSession,
+    paths: &RosePaths,
+    cert: &[u8],
+) -> anyhow::Result<()> {
+    let existing = totp::secret_for_authorized_cert(&paths.authorized_certs_dir, cert)?;
+    let secret = if let Some(secret) = existing {
+        secret
+    } else {
+        let Some(cert_path) = config::authorized_cert_path(&paths.authorized_certs_dir, cert)
+        else {
+            anyhow::bail!("client certificate is not authorized");
+        };
+        let (encoded, uri) = totp::enroll_client_totp(&cert_path)?;
+        session
+            .send_control(&ControlMessage::TotpEnroll {
+                secret: encoded.clone(),
+                uri,
+            })
+            .await?;
+        totp::decode_secret(&encoded)?
+    };
+    session.send_control(&ControlMessage::TotpChallenge).await?;
+    match session.recv_control().await? {
+        Some(ControlMessage::TotpResponse { code }) if totp::totp_verify_now(&secret, &code) => {
+            Ok(())
+        }
+        _ => anyhow::bail!("invalid TOTP code"),
+    }
+}
+
 /// COVERAGE: Session handler is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_server_session(
     conn: quinn::Connection,
     store: SessionStore,
     bootstrap: bool,
+    paths: RosePaths,
 ) -> anyhow::Result<()> {
     let peer_cert = extract_peer_cert(&conn);
     let (mut session, handshake) = ServerSession::accept_any(conn).await?;
+    if !bootstrap {
+        complete_client_auth(&mut session, &paths, peer_cert.as_deref()).await?;
+    }
 
     let (session_id, mut pty, terminal, ssp_sender, rows, cols) = match handshake {
         ControlMessage::Hello {
@@ -903,17 +1047,46 @@ mod tests {
     use crate::transport::QuicClient;
 
     async fn receive_stream_frame(conn: &quinn::Connection) -> SspFrame {
-        let mut stream = conn.accept_uni().await.unwrap();
-        let mut kind = [0];
-        stream.read_exact(&mut kind).await.unwrap();
-        assert_eq!(kind[0], scrollback::stream_type::SSP_FRAME);
-        let mut length = [0; 4];
-        stream.read_exact(&mut length).await.unwrap();
-        let data = stream
-            .read_to_end(u32::from_be_bytes(length) as usize)
-            .await
-            .unwrap();
-        SspFrame::decode(&data).unwrap()
+        loop {
+            let mut stream = conn.accept_uni().await.unwrap();
+            let mut kind = [0];
+            stream.read_exact(&mut kind).await.unwrap();
+            if kind[0] != scrollback::stream_type::SSP_FRAME {
+                continue;
+            }
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).await.unwrap();
+            let data = stream
+                .read_to_end(u32::from_be_bytes(length) as usize)
+                .await
+                .unwrap();
+            return SspFrame::decode(&data).unwrap();
+        }
+    }
+
+    fn test_session_paths() -> (tempfile::TempDir, RosePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RosePaths::with_base(dir.path().to_path_buf());
+        let cfg = RoseConfig {
+            require_client_certs: false,
+            ..RoseConfig::default()
+        };
+        cfg.save(&paths.config_dir).unwrap();
+        (dir, paths)
+    }
+
+    fn spawn_handler(
+        conn: quinn::Connection,
+        store: SessionStore,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tempfile::TempDir,
+    ) {
+        let (dir, paths) = test_session_paths();
+        (
+            tokio::spawn(handle_server_session(conn, store, false, paths)),
+            dir,
+        )
     }
 
     struct NativeSession {
@@ -923,6 +1096,7 @@ mod tests {
         session_id: [u8; 16],
         _fixture: MtlsFixture,
         _client: QuicClient,
+        _paths: tempfile::TempDir,
     }
 
     impl NativeSession {
@@ -932,11 +1106,7 @@ mod tests {
             let client = QuicClient::new().unwrap();
             let (server_conn, client_conn) =
                 tokio::join!(fixture.server.accept(), fixture.connect(&client));
-            let task = tokio::spawn(handle_server_session(
-                server_conn.unwrap().unwrap(),
-                store.clone(),
-                false,
-            ));
+            let (task, paths) = spawn_handler(server_conn.unwrap().unwrap(), store.clone());
             let mut session = ClientSession::connect(client_conn, 5, 80, vec![])
                 .await
                 .unwrap();
@@ -952,6 +1122,7 @@ mod tests {
                 session_id,
                 _fixture: fixture,
                 _client: client,
+                _paths: paths,
             }
         }
 
@@ -988,11 +1159,7 @@ mod tests {
             tokio::join!(fixture.server.accept(), fixture.connect(&client));
         let store = SessionStore::new();
         store.mark_ended([0x44; 16]);
-        let task = tokio::spawn(handle_server_session(
-            server_conn.unwrap().unwrap(),
-            store,
-            false,
-        ));
+        let (task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), store);
         let mut session = ClientSession::reconnect(client_conn, 5, 80, [0x44; 16], vec![])
             .await
             .unwrap();
@@ -1035,11 +1202,7 @@ mod tests {
             native._fixture.server.accept(),
             native._fixture.connect(&native._client)
         );
-        let task = tokio::spawn(handle_server_session(
-            server_conn.unwrap().unwrap(),
-            native.store.clone(),
-            false,
-        ));
+        let (task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), native.store.clone());
         let mut session = ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
             .await
             .unwrap();
@@ -1119,11 +1282,7 @@ mod tests {
             native._fixture.server.accept(),
             native._fixture.connect(&native._client)
         );
-        let task = tokio::spawn(handle_server_session(
-            server_conn.unwrap().unwrap(),
-            native.store.clone(),
-            false,
-        ));
+        let (task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), native.store.clone());
         let mut session = ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
             .await
             .unwrap();
@@ -1271,11 +1430,7 @@ mod tests {
                 native._fixture.server.accept(),
                 native._fixture.connect(&native._client)
             );
-            let task = tokio::spawn(handle_server_session(
-                server_conn.unwrap().unwrap(),
-                native.store.clone(),
-                false,
-            ));
+            let (task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), native.store.clone());
             let mut session =
                 ClientSession::reconnect(client_conn, 5, 80, native.session_id, vec![])
                     .await
@@ -1323,7 +1478,7 @@ mod tests {
         let id = [0x55; 16];
         store.mark_ended(id);
         store.retain_final_screen(id, crate::ssp::ScreenState::empty(5), Some(vec![0xff]));
-        let task = tokio::spawn(handle_server_session(server_conn, store.clone(), false));
+        let (task, _paths) = spawn_handler(server_conn, store.clone());
         let mut session = ClientSession::reconnect(client_conn, 5, 80, id, vec![])
             .await
             .unwrap();
@@ -1398,11 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn child_polling_preserves_fragmented_control_messages() {
         let (client_conn, server_conn, _fixture, _client) = crate::testutil::connected_pair().await;
-        let task = tokio::spawn(handle_server_session(
-            server_conn,
-            SessionStore::new(),
-            false,
-        ));
+        let (task, _paths) = spawn_handler(server_conn, SessionStore::new());
         let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
         protocol::write_control(
             &mut send,
@@ -1525,11 +1676,7 @@ mod tests {
 
         let (server_conn, client_conn) =
             tokio::join!(fixture.server.accept(), fixture.connect(&client));
-        let task = tokio::spawn(handle_server_session(
-            server_conn.unwrap().unwrap(),
-            store,
-            false,
-        ));
+        let (task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), store);
         let mut session = ClientSession::reconnect(client_conn, 5, 20, session_id, vec![])
             .await
             .unwrap();
@@ -1652,11 +1799,7 @@ mod tests {
         let client = QuicClient::new().unwrap();
         let (server_conn, client_conn) =
             tokio::join!(fixture.server.accept(), fixture.connect(&client));
-        let server_task = tokio::spawn(handle_server_session(
-            server_conn.unwrap().unwrap(),
-            store,
-            false,
-        ));
+        let (server_task, _paths) = spawn_handler(server_conn.unwrap().unwrap(), store);
         let mut session = ClientSession::reconnect(client_conn, 5, 20, session_id, vec![])
             .await
             .unwrap();
@@ -1706,6 +1849,68 @@ mod tests {
             .unwrap();
         assert!(resized.is_ok(), "resize was not sent without PTY output");
         assert!(receiver.state().rows[0].contains("idle"));
+    }
+
+    #[tokio::test]
+    async fn pairing_sends_auth_required_then_session_after_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RosePaths::with_base(dir.path().to_path_buf());
+        let cfg = RoseConfig {
+            pairing: true,
+            pairing_code_digits: 4,
+            ..RoseConfig::default()
+        };
+        cfg.save(&paths.config_dir).unwrap();
+        std::fs::create_dir_all(&paths.authorized_certs_dir).unwrap();
+
+        let server_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let client_cert = config::generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+        let server = crate::transport::QuicServer::bind_mutual_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cert,
+            paths.authorized_certs_dir.as_path(),
+            dir.path(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_cert_der = server.server_cert_der().clone();
+        let store = SessionStore::new();
+        let session_paths = paths.clone();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap().unwrap();
+            handle_server_session(incoming, store, false, session_paths).await
+        });
+
+        let client = QuicClient::new().unwrap();
+        let conn = client
+            .connect_with_cert(addr, "localhost", &server_cert_der, &client_cert)
+            .await
+            .unwrap();
+        let mut session = ClientSession::connect(conn, 5, 80, vec![]).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(3), session.recv_control())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let ControlMessage::AuthRequired {
+            pairing_code: Some(code),
+            pairing_ttl_secs,
+            ..
+        } = msg
+        else {
+            panic!("expected AuthRequired, got {msg:?}");
+        };
+        assert_eq!(code.len(), 4);
+        assert_eq!(pairing_ttl_secs, 30);
+        config::approve_pending_client_cert(dir.path(), &paths.authorized_certs_dir, &code, None)
+            .unwrap();
+        let info = tokio::time::timeout(Duration::from_secs(5), session.recv_control())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(info, ControlMessage::SessionInfo { .. }));
+        accept.abort();
     }
 
     #[test]

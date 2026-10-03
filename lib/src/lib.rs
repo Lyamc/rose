@@ -12,9 +12,11 @@ pub mod pty;
 mod pty_io;
 pub mod scrollback;
 pub mod session;
+pub mod sso;
 pub mod ssp;
 pub mod stun;
 pub mod terminal;
+pub mod totp;
 pub mod transport;
 
 #[cfg(test)]

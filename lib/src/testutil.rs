@@ -31,6 +31,7 @@ impl MtlsFixture {
             "127.0.0.1:0".parse().unwrap(),
             server_cert,
             auth_dir.path(),
+            auth_dir.path(),
         )
         .unwrap();
 

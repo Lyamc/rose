@@ -33,7 +33,7 @@ pub enum ProtocolError {
 
 /// Current protocol version. Incremented when the wire format changes
 /// in an incompatible way.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Control messages exchanged over the reliable bi-stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +78,31 @@ pub enum ControlMessage {
         /// Unique session identifier.
         session_id: [u8; 16],
     },
+    /// Unauthorized client: pairing PIN and/or SSO device-flow instructions.
+    AuthRequired {
+        /// Numeric pairing code, if pairing is enabled.
+        pairing_code: Option<String>,
+        /// Seconds until the pairing request expires.
+        pairing_ttl_secs: u32,
+        /// Browser URL for `OpenID` Connect device login.
+        sso_uri: Option<String>,
+        /// User code to type at `sso_uri`.
+        sso_user_code: Option<String>,
+    },
+    /// Server asks the client to send a TOTP code.
+    TotpChallenge,
+    /// Client TOTP response.
+    TotpResponse {
+        /// Authenticator digits.
+        code: String,
+    },
+    /// First-login TOTP enrollment.
+    TotpEnroll {
+        /// Base32 secret.
+        secret: String,
+        /// `otpauth://` URI.
+        uri: String,
+    },
 }
 
 // Wire format constants
@@ -86,6 +111,39 @@ const MSG_RESIZE: u8 = 2;
 const MSG_GOODBYE: u8 = 3;
 const MSG_RECONNECT: u8 = 4;
 const MSG_SESSION_INFO: u8 = 5;
+const MSG_AUTH_REQUIRED: u8 = 6;
+const MSG_TOTP_CHALLENGE: u8 = 7;
+const MSG_TOTP_RESPONSE: u8 = 8;
+const MSG_TOTP_ENROLL: u8 = 9;
+
+fn encode_opt_string(value: Option<&str>, buf: &mut Vec<u8>) {
+    match value {
+        None => buf.extend_from_slice(&0u16.to_be_bytes()),
+        Some(text) => {
+            let bytes = text.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn decode_opt_string(payload: &[u8], pos: &mut usize) -> Result<Option<String>, ProtocolError> {
+    if *pos + 2 > payload.len() {
+        return Err(ProtocolError::InvalidMessage("truncated string".into()));
+    }
+    let len = u16::from_be_bytes([payload[*pos], payload[*pos + 1]]) as usize;
+    *pos += 2;
+    if len == 0 {
+        return Ok(None);
+    }
+    if *pos + len > payload.len() {
+        return Err(ProtocolError::InvalidMessage("truncated string".into()));
+    }
+    let text = String::from_utf8(payload[*pos..*pos + len].to_vec())
+        .map_err(|e| ProtocolError::InvalidMessage(format!("invalid UTF-8: {e}")))?;
+    *pos += len;
+    Ok(Some(text))
+}
 
 /// Encodes a list of key-value pairs as `[num: u16][key_len: u16][key][val_len: u16][val]...`.
 fn encode_env_vars(vars: &[(String, String)], buf: &mut Vec<u8>) {
@@ -196,6 +254,31 @@ impl ControlMessage {
                 buf.extend_from_slice(session_id);
                 buf
             }
+            Self::AuthRequired {
+                pairing_code,
+                pairing_ttl_secs,
+                sso_uri,
+                sso_user_code,
+            } => {
+                let mut buf = vec![MSG_AUTH_REQUIRED];
+                buf.extend_from_slice(&pairing_ttl_secs.to_be_bytes());
+                encode_opt_string(pairing_code.as_deref(), &mut buf);
+                encode_opt_string(sso_uri.as_deref(), &mut buf);
+                encode_opt_string(sso_user_code.as_deref(), &mut buf);
+                buf
+            }
+            Self::TotpChallenge => vec![MSG_TOTP_CHALLENGE],
+            Self::TotpResponse { code } => {
+                let mut buf = vec![MSG_TOTP_RESPONSE];
+                encode_opt_string(Some(code), &mut buf);
+                buf
+            }
+            Self::TotpEnroll { secret, uri } => {
+                let mut buf = vec![MSG_TOTP_ENROLL];
+                encode_opt_string(Some(secret), &mut buf);
+                encode_opt_string(Some(uri), &mut buf);
+                buf
+            }
         }
     }
 
@@ -269,6 +352,37 @@ impl ControlMessage {
                     version,
                     session_id,
                 })
+            }
+            MSG_AUTH_REQUIRED => {
+                if payload.len() < 4 {
+                    return Err(ProtocolError::InvalidMessage(
+                        "AuthRequired too short".into(),
+                    ));
+                }
+                let pairing_ttl_secs =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let mut pos = 4;
+                let pairing_code = decode_opt_string(payload, &mut pos)?;
+                let sso_uri = decode_opt_string(payload, &mut pos)?;
+                let sso_user_code = decode_opt_string(payload, &mut pos)?;
+                Ok(Self::AuthRequired {
+                    pairing_code,
+                    pairing_ttl_secs,
+                    sso_uri,
+                    sso_user_code,
+                })
+            }
+            MSG_TOTP_CHALLENGE => Ok(Self::TotpChallenge),
+            MSG_TOTP_RESPONSE => {
+                let mut pos = 0;
+                let code = decode_opt_string(payload, &mut pos)?.unwrap_or_default();
+                Ok(Self::TotpResponse { code })
+            }
+            MSG_TOTP_ENROLL => {
+                let mut pos = 0;
+                let secret = decode_opt_string(payload, &mut pos)?.unwrap_or_default();
+                let uri = decode_opt_string(payload, &mut pos)?.unwrap_or_default();
+                Ok(Self::TotpEnroll { secret, uri })
             }
             other => Err(ProtocolError::InvalidMessage(format!(
                 "unknown message type: {other}"
@@ -648,6 +762,37 @@ mod tests {
         let encoded = msg.encode();
         let decoded = ControlMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn encode_decode_auth_and_totp() {
+        let msg = ControlMessage::AuthRequired {
+            pairing_code: Some("44".into()),
+            pairing_ttl_secs: 15,
+            sso_uri: Some("https://idp.example/device".into()),
+            sso_user_code: Some("WDJB-MJHT".into()),
+        };
+        assert_eq!(ControlMessage::decode(&msg.encode()).unwrap(), msg);
+        let empty = ControlMessage::AuthRequired {
+            pairing_code: None,
+            pairing_ttl_secs: 0,
+            sso_uri: None,
+            sso_user_code: None,
+        };
+        assert_eq!(ControlMessage::decode(&empty.encode()).unwrap(), empty);
+        assert_eq!(
+            ControlMessage::decode(&ControlMessage::TotpChallenge.encode()).unwrap(),
+            ControlMessage::TotpChallenge
+        );
+        let totp = ControlMessage::TotpResponse {
+            code: "123456".into(),
+        };
+        assert_eq!(ControlMessage::decode(&totp.encode()).unwrap(), totp);
+        let enroll = ControlMessage::TotpEnroll {
+            secret: "GEZDGNBVGY3TQOJQ".into(),
+            uri: "otpauth://totp/RoSE:x".into(),
+        };
+        assert_eq!(ControlMessage::decode(&enroll.encode()).unwrap(), enroll);
     }
 
     #[test]

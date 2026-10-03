@@ -40,12 +40,48 @@ On first start the server writes a self-signed certificate under the config dire
 3. For a self-signed server certificate, the client trusts it on first use and caches it in `known_hosts/`.
 4. A server behind a reverse proxy with a CA-signed certificate does not need that cache.
 
-Unix config lives in `~/.config/rose/`. The Windows service uses `%ProgramData%\RoSE\` instead, because it runs as LocalSystem and has no user home directory.
+Config is `config.toml` next to the `rose` executable when that file exists.
+Otherwise Unix uses `~/.config/rose/` and Windows uses `%ProgramData%\RoSE\`
+(the service data directory). `--config-dir` overrides either default.
 
 ```sh
 rose connect myserver.example.com
 rose connect myserver.example.com --port 4433
+rose connect myserver.example.com --retry-limit -1 --always-retry
 ```
+
+Change a running server without restarting it. `rose ctl` writes `config.toml`
+(and `authorized_certs/` for authorize/revoke); the server rereads those files.
+
+```sh
+rose ctl show
+rose ctl set require_client_certs false
+rose ctl set max_sessions 8
+rose ctl authorize ~/.config/rose/client.crt.der --name lyam
+rose ctl revoke lyam
+rose ctl pending
+rose ctl set pairing true
+rose ctl approve 12345678
+rose ctl totp init
+```
+
+Pairing is off by default. After `rose ctl set pairing true`, an unauthorized `rose connect` stays up and prints a numeric code (default 8 digits, 2 minutes). On the server, `rose ctl approve <code>` (alias `rose ctl pair`) copies that certificate into `authorized_certs/`. Shorter codes expire faster (2 digits 15s, 4 digits 30s, 6 digits 1 minute, 8 digits 2 minutes, up to 1 hour). `rose ctl deny` discards one.
+
+`totp_required` challenges every new login with a 6-digit TOTP code; first login prints an `otpauth://` URI. `rose ctl totp init` stores an operator secret in `operator.totp` so `approve` also needs `--totp`. OpenID Connect device login is available when `sso_issuer` and `sso_client_id` are set.
+
+`require_client_certs` defaults to `true`. When it is `false`, any client can
+connect. Setting it back to `true` closes sessions that no longer have an
+authorized certificate. `alias rosectl='rose ctl'` if you want a shorter name.
+
+If the server is listening but rejects the client (the client certificate is
+missing from `authorized_certs/`, or the handshake fails for another
+authentication reason), `rose connect` prints the reason and stops. Use
+`--always-retry` to keep trying anyway. `--retry-limit` caps the number of
+initial attempts (`-1` is unlimited; the default is 10). `--retry-interval
+<seconds>` uses a constant delay; the default schedule is 1s, 2s, 3s, 5s, 5s,
+5s, 10s, 10s, 10s, 30s, then 60s doubling up to one hour. The same keys can be
+set in `config.toml` as `always_retry`, `retry_limit`, and
+`retry_interval_secs`.
 
 ### Windows service
 
@@ -64,7 +100,7 @@ rose service uninstall
 - Adds an inbound UDP firewall rule named `RoSE` for the listen port. QUIC is UDP; a TCP rule does not open the server.
 - Starts the service after the socket is bound.
 
-Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each DER client certificate (`client.crt.der` from `rose keygen`) in `%ProgramData%\RoSE\authorized_certs\` and name it with a `.crt` suffix. The service listens when that directory is empty and refuses every client until a certificate is added and the service is restarted. `--listen` and `--hostname` match `rose server`.
+Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each DER client certificate (`client.crt.der` from `rose keygen`) in `%ProgramData%\RoSE\authorized_certs\` and name it with a `.crt` suffix, or use `rose ctl authorize`. `rose ctl` finds that directory by default on Windows. The service listens when that directory is empty and refuses every client until a matching `.crt` is present, unless `require_client_certs` is `false`. Adding or removing a certificate, and `rose ctl set`, take effect immediately; a restart is not required. `--listen` and `--hostname` match `rose server`. A portable layout is a `rose.exe` with `config.toml` beside it; that directory is used instead of `%ProgramData%\RoSE`.
 
 `uninstall` stops the service, deletes the `RoSE` firewall rule, and removes `%ProgramFiles%\RoSE`. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
 
@@ -103,7 +139,7 @@ services.rose.enable = true;
 services.rose.openFirewall = true;
 ```
 
-`hostnames` is written into the server certificate on first start. Delete `server.crt` and `server.key` in the config directory before restarting if that list changes. Files in `authorizedCerts` must be DER-encoded. `rose keygen` writes that encoding to `client.crt.der`. The server only loads files in `authorized_certs/` whose names end in `.crt`. It listens when that directory is empty and refuses every client until a certificate is added and the service is restarted.
+`hostnames` is written into the server certificate on first start. Delete `server.crt` and `server.key` in the config directory before restarting if that list changes. Files in `authorizedCerts` must be DER-encoded. `rose keygen` writes that encoding to `client.crt.der`. The server only loads files in `authorized_certs/` whose names end in `.crt`. It listens when that directory is empty and refuses every client until a matching `.crt` is present. Adding or removing a certificate takes effect immediately.
 
 ### SSH bootstrap mode
 

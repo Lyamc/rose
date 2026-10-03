@@ -66,6 +66,16 @@ enum Commands {
         #[arg(long)]
         bootstrap: bool,
     },
+    /// Inspect or change the persistent server configuration.
+    Ctl {
+        /// Config directory. Defaults to `config.toml` next to this
+        /// executable, then `%ProgramData%\RoSE` on Windows or
+        /// `$HOME/.config/rose` on Unix.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<CtlAction>,
+    },
     /// Generate X.509 client certificates for authentication.
     Keygen,
     /// Install or remove the Windows service and its firewall rule.
@@ -73,6 +83,48 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+/// `rose ctl` actions.
+#[derive(Subcommand)]
+enum CtlAction {
+    /// Print the full `config.toml`.
+    Show,
+    /// Print one config value.
+    Get { key: String },
+    /// Set one config value and write `config.toml`.
+    Set { key: String, value: String },
+    /// Copy a client certificate into `authorized_certs/`.
+    Authorize {
+        cert: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a `.crt` from `authorized_certs/`.
+    Revoke { name: String },
+    /// List pairing codes from clients waiting to be approved.
+    Pending,
+    /// Authorize a client by the pairing code shown on `rose connect`.
+    #[command(visible_alias = "pair")]
+    Approve {
+        code: String,
+        #[arg(long)]
+        totp: Option<String>,
+    },
+    /// Discard a pending pairing request.
+    Deny { code: String },
+    /// Operator TOTP secret for `rose ctl approve`.
+    Totp {
+        #[command(subcommand)]
+        action: TotpAction,
+    },
+}
+
+/// `rose ctl totp` actions.
+#[derive(Subcommand)]
+enum TotpAction {
+    /// Write a new `operator.totp` and print the otpauth URI.
+    Init,
 }
 
 /// Windows service lifecycle commands.

@@ -5,11 +5,14 @@
 //! scrollback sync).
 
 use std::net::SocketAddr;
-
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{self, CertKeyPair, ConfigError};
 use rustls::pki_types::CertificateDer;
+
+/// How often an accepted connection re-checks `authorized_certs/`.
+const AUTHORIZATION_POLL: Duration = Duration::from_millis(200);
 
 /// Errors that can occur in the transport layer.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +36,8 @@ pub struct QuicServer {
     /// The underlying QUIC endpoint.
     pub endpoint: quinn::Endpoint,
     cert: CertKeyPair,
+    authorized_certs_dir: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl QuicServer {
@@ -46,16 +51,25 @@ impl QuicServer {
         addr: SocketAddr,
         cert: CertKeyPair,
         authorized_certs_dir: &Path,
+        config_dir: &Path,
     ) -> Result<Self, TransportError> {
-        let server_config = config::build_mutual_tls_server_config(&cert, authorized_certs_dir)?;
+        let server_config =
+            config::build_mutual_tls_server_config(&cert, authorized_certs_dir, config_dir)?;
         let endpoint =
             quinn::Endpoint::server(server_config, addr).map_err(TransportError::Bind)?;
-        Ok(Self { endpoint, cert })
+        Ok(Self {
+            endpoint,
+            cert,
+            authorized_certs_dir: authorized_certs_dir.to_path_buf(),
+            config_dir: config_dir.to_path_buf(),
+        })
     }
 
     /// Accepts the next incoming QUIC connection.
     ///
-    /// Returns `None` if the endpoint has been closed.
+    /// Returns `None` if the endpoint has been closed. After a successful
+    /// handshake the connection is watched against `authorized_certs/`; removing
+    /// the client certificate closes it.
     ///
     /// # Errors
     ///
@@ -65,6 +79,11 @@ impl QuicServer {
             return Ok(None);
         };
         let conn = incoming.await?;
+        watch_authorized_client(
+            conn.clone(),
+            self.authorized_certs_dir.clone(),
+            self.config_dir.clone(),
+        );
         Ok(Some(conn))
     }
 
@@ -109,6 +128,46 @@ impl QuicServer {
     pub fn punch_hole(&self, target: SocketAddr) {
         send_punch_packets(self.endpoint.clone(), target);
     }
+}
+
+/// DER-encoded end-entity certificate presented by the peer, if any.
+#[must_use]
+pub fn peer_certificate_der(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    let identity = conn.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs.first().map(|cert| cert.as_ref().to_vec())
+}
+
+fn watch_authorized_client(
+    conn: quinn::Connection,
+    authorized_certs_dir: PathBuf,
+    config_dir: PathBuf,
+) {
+    tokio::spawn(async move {
+        let peer_cert = peer_certificate_der(&conn);
+        loop {
+            if config::client_certs_required(&config_dir) {
+                let authorized = peer_cert.as_deref().is_some_and(|cert| {
+                    config::is_authorized_client_cert(&authorized_certs_dir, cert)
+                });
+                let pairing =
+                    peer_cert.is_some() && config::provisional_unauthorized_ok(&config_dir);
+                if !authorized && !pairing {
+                    let reason = if peer_cert.is_some() {
+                        b"client certificate revoked".as_slice()
+                    } else {
+                        b"client certificate required".as_slice()
+                    };
+                    conn.close(0u32.into(), reason);
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = conn.closed() => return,
+                () = tokio::time::sleep(AUTHORIZATION_POLL) => {}
+            }
+        }
+    });
 }
 
 /// A lightweight handle for sending hole-punch packets from a server endpoint.

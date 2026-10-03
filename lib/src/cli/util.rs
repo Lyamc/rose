@@ -251,11 +251,7 @@ pub(super) fn connect_command(
 /// side it returns the server's certificate. Returns `None` if the peer
 /// did not present a certificate (e.g., no mutual TLS).
 pub(super) fn extract_peer_cert(conn: &quinn::Connection) -> Option<Vec<u8>> {
-    let identity = conn.peer_identity()?;
-    let certs = identity
-        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-        .ok()?;
-    certs.first().map(|c| c.as_ref().to_vec())
+    crate::transport::peer_certificate_der(conn)
 }
 
 /// Parses a `ROSE_BOOTSTRAP` line from the server's stdout.

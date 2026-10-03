@@ -52,9 +52,13 @@ fn keystroke_roundtrip(c: &mut Criterion) {
         std::fs::create_dir_all(&auth_dir).unwrap();
         std::fs::write(auth_dir.join("client.crt"), client_cert.cert_der.as_ref()).unwrap();
 
-        let server =
-            QuicServer::bind_mutual_tls("127.0.0.1:0".parse().unwrap(), server_cert, &auth_dir)
-                .unwrap();
+        let server = QuicServer::bind_mutual_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cert,
+            &auth_dir,
+            &auth_dir,
+        )
+        .unwrap();
         let addr = server.local_addr().unwrap();
         let cert_der = server.server_cert_der().clone();
 

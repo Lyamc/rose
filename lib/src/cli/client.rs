@@ -10,6 +10,9 @@ use bytes::Bytes;
 use crossterm::terminal;
 
 use super::input::{InputAction, KeyboardInput, read_keyboard_events};
+use super::retry::{
+    ConnectFailureKind, RetryPolicy, classify_anyhow, classify_transport, explain_rejection,
+};
 use super::util::{
     RawModeGuard, connect_command, extract_peer_cert, hex_encode, load_or_generate_client_cert,
 };
@@ -162,6 +165,7 @@ pub(super) async fn run_client(
     cert_path: Option<PathBuf>,
     client_cert_path: Option<PathBuf>,
     session_id: Option<[u8; 16]>,
+    retry_flags: super::retry::RetryFlags,
 ) -> anyhow::Result<()> {
     let reattach_command = connect_command(
         host,
@@ -171,6 +175,7 @@ pub(super) async fn run_client(
     );
     let paths = RosePaths::resolve();
     let cfg = config::RoseConfig::load(&paths.config_dir)?;
+    let retry = retry_flags.resolve(&cfg);
 
     let client_cert = if let Some(ref path) = client_cert_path {
         let cert_der_bytes = std::fs::read(path)?;
@@ -221,7 +226,16 @@ pub(super) async fn run_client(
 
     let _raw_guard = RawModeGuard::enable()?;
 
-    client_session_loop(addr, host, client_config, session_id, reattach_command).await
+    client_session_loop(
+        addr,
+        host,
+        client_config,
+        session_id,
+        reattach_command,
+        retry,
+        None,
+    )
+    .await
 }
 
 /// Performs a TOFU (Trust On First Use) first connection: connects to the
@@ -238,10 +252,26 @@ async fn tofu_first_connect(
     let conn = client
         .connect_with_config(tofu_config, addr, host)
         .await
-        .map_err(|e| anyhow::anyhow!("TOFU connection to {host}:{} failed: {e}", addr.port()))?;
+        .map_err(|e| {
+            let wrapped = anyhow::anyhow!("TOFU connection to {host}:{} failed: {e}", addr.port());
+            if classify_transport(&e) == ConnectFailureKind::Rejected {
+                anyhow::anyhow!(explain_rejection(&e, None))
+            } else {
+                wrapped
+            }
+        })?;
 
     let server_cert_der = extract_peer_cert(&conn)
         .ok_or_else(|| anyhow::anyhow!("server did not present a certificate"))?;
+
+    // The server can finish its TLS flight (so the cert is visible) and then
+    // reject the client certificate. Wait briefly so that shows up here.
+    if let Ok(reason) = tokio::time::timeout(Duration::from_millis(500), conn.closed()).await {
+        let err = crate::transport::TransportError::from(reason);
+        if classify_transport(&err) == ConnectFailureKind::Rejected {
+            anyhow::bail!("{}", explain_rejection(&err, None));
+        }
+    }
 
     conn.close(0u32.into(), b"tofu check");
 
@@ -265,7 +295,7 @@ async fn tofu_first_connect(
     Ok(rustls::pki_types::CertificateDer::from(server_cert_der))
 }
 
-/// Reconnection loop: connects/reconnects to the server with exponential backoff.
+/// Reconnection loop: connects/reconnects to the server with decaying backoff.
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -275,16 +305,19 @@ pub(super) async fn client_session_loop(
     client_config: quinn::ClientConfig,
     session_id: Option<[u8; 16]>,
     reattach_command: String,
+    retry: RetryPolicy,
+    pairing_code: Option<String>,
 ) -> anyhow::Result<()> {
-    client_session_loop_inner(
+    client_session_loop_inner(SessionLoopConfig {
         addr,
         server_name,
         client_config,
-        None,
-        None,
+        start: LoopStart::Fresh,
         session_id,
         reattach_command,
-    )
+        retry,
+        pairing_code,
+    })
     .await
 }
 
@@ -298,17 +331,19 @@ pub(super) async fn client_session_loop_with_conn(
     addr: SocketAddr,
     server_name: &str,
     client_config: quinn::ClientConfig,
+    retry: RetryPolicy,
 ) -> anyhow::Result<()> {
     let reattach_command = connect_command(server_name, addr.port(), None, None);
-    client_session_loop_inner(
+    client_session_loop_inner(SessionLoopConfig {
         addr,
         server_name,
         client_config,
-        Some(first_conn),
-        None,
-        None,
+        start: LoopStart::Connection(first_conn),
+        session_id: None,
         reattach_command,
-    )
+        retry,
+        pairing_code: None,
+    })
     .await
 }
 
@@ -323,20 +358,25 @@ pub(super) async fn client_session_loop_with_client(
     server_name: &str,
     client_config: quinn::ClientConfig,
     stun_ctx: StunReconnectContext,
+    retry: RetryPolicy,
 ) -> anyhow::Result<()> {
     let conn = first_client
         .connect_with_config(client_config.clone(), addr, server_name)
         .await?;
     let reattach_command = connect_command(server_name, addr.port(), None, None);
-    client_session_loop_inner(
+    client_session_loop_inner(SessionLoopConfig {
         addr,
         server_name,
         client_config,
-        Some(conn),
-        Some(stun_ctx),
-        None,
+        start: LoopStart::Stun {
+            conn,
+            ctx: stun_ctx,
+        },
+        session_id: None,
         reattach_command,
-    )
+        retry,
+        pairing_code: None,
+    })
     .await
 }
 
@@ -369,22 +409,150 @@ enum SessionHandshake {
     Retry,
 }
 
-async fn receive_session_id(session: &mut ClientSession) -> anyhow::Result<SessionHandshake> {
-    match tokio::time::timeout(Duration::from_secs(5), session.recv_control()).await {
-        Ok(Ok(Some(ControlMessage::SessionInfo {
-            version,
-            session_id,
-        }))) => {
-            anyhow::ensure!(
-                version == PROTOCOL_VERSION,
-                "unsupported protocol version {version} (expected {PROTOCOL_VERSION})"
-            );
-            Ok(SessionHandshake::Ready(session_id))
+async fn receive_session_id(
+    session: &mut ClientSession,
+    keyboard: Option<&KeyboardInput>,
+) -> anyhow::Result<SessionHandshake> {
+    let mut wait = Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(wait, session.recv_control()).await {
+            Ok(Ok(Some(ControlMessage::SessionInfo {
+                version,
+                session_id,
+            }))) => {
+                anyhow::ensure!(
+                    version == PROTOCOL_VERSION,
+                    "unsupported protocol version {version} (expected {PROTOCOL_VERSION})"
+                );
+                return Ok(SessionHandshake::Ready(session_id));
+            }
+            Ok(Ok(Some(ControlMessage::Goodbye))) => return Ok(SessionHandshake::Unavailable),
+            Ok(Ok(Some(ControlMessage::AuthRequired {
+                pairing_code,
+                pairing_ttl_secs,
+                sso_uri,
+                sso_user_code,
+            }))) => {
+                if let Some(code) = pairing_code {
+                    rose_status(&format!(
+                        "pairing code {code} (valid {pairing_ttl_secs}s). On the server: rose ctl approve {code}"
+                    ));
+                }
+                let has_sso = sso_uri.is_some();
+                if let (Some(uri), Some(user_code)) = (sso_uri, sso_user_code) {
+                    rose_status(&format!("SSO: open {uri} and enter {user_code}"));
+                }
+                let mut wait_secs = u64::from(pairing_ttl_secs);
+                if has_sso {
+                    wait_secs = wait_secs.max(600);
+                }
+                wait = Duration::from_secs(wait_secs.saturating_add(5).max(15));
+            }
+            Ok(Ok(Some(ControlMessage::TotpEnroll { secret, uri }))) => {
+                rose_status(&format!(
+                    "enroll this TOTP secret in an authenticator app: {secret}"
+                ));
+                rose_status(&uri);
+                wait = Duration::from_secs(120);
+            }
+            Ok(Ok(Some(ControlMessage::TotpChallenge))) => {
+                let Some(keyboard) = keyboard else {
+                    anyhow::bail!("server requested TOTP but no keyboard is available");
+                };
+                rose_status("enter TOTP code");
+                let code = keyboard.read_prompt_line().await?;
+                session
+                    .send_control(&ControlMessage::TotpResponse { code })
+                    .await?;
+                wait = Duration::from_secs(60);
+            }
+            Ok(Ok(Some(other))) => anyhow::bail!("expected SessionInfo, got {other:?}"),
+            Ok(Ok(None) | Err(_)) | Err(_) => return Ok(SessionHandshake::Retry),
         }
-        Ok(Ok(Some(ControlMessage::Goodbye))) => Ok(SessionHandshake::Unavailable),
-        Ok(Ok(Some(other))) => anyhow::bail!("expected SessionInfo, got {other:?}"),
-        Ok(Ok(None) | Err(_)) | Err(_) => Ok(SessionHandshake::Retry),
     }
+}
+
+fn rose_status(message: &str) {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(format!("\r\n[RoSE: {message}]\r\n").as_bytes());
+    let _ = stdout.flush();
+}
+
+/// Shared retry state for a failed connect.
+struct ConnectFailureCtx<'a> {
+    keyboard: &'a KeyboardInput,
+    retry: RetryPolicy,
+    reattach_command: &'a str,
+    pairing_code: Option<&'a str>,
+}
+
+impl ConnectFailureCtx<'_> {
+    /// Records a failed connect, prints why, and waits for the next attempt.
+    ///
+    /// Returns `Ok(true)` when the user asked to disconnect during the wait.
+    ///
+    /// COVERAGE: CLI helper; classification is unit-tested in `retry`.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn report(
+        &self,
+        session_id: Option<[u8; 16]>,
+        failed_attempts: &mut u32,
+        error: anyhow::Error,
+        kind: ConnectFailureKind,
+    ) -> anyhow::Result<bool> {
+        let message = if kind == ConnectFailureKind::Rejected {
+            explain_rejection(&error, self.pairing_code)
+        } else {
+            error.to_string()
+        };
+        rose_status(&message);
+
+        *failed_attempts = failed_attempts.saturating_add(1);
+        let unlimited = session_id.is_some() || self.retry.retry_limit < 0;
+        if !self.retry.should_retry(kind) {
+            anyhow::bail!("{message}");
+        }
+        if self.retry.exhausted(*failed_attempts, session_id.is_some()) {
+            rose_status("could not connect to server, giving up");
+            anyhow::bail!("failed to connect after {failed_attempts} attempts");
+        }
+
+        let delay = self.retry.delay_after(*failed_attempts);
+        let progress = if unlimited {
+            format!("{failed_attempts}")
+        } else {
+            let limit = if self.retry.retry_limit == 0 {
+                1
+            } else {
+                self.retry.retry_limit
+            };
+            format!("{failed_attempts}/{limit}")
+        };
+        rose_status(&format!("retrying in {}s ({progress})...", delay.as_secs()));
+        wait_or_disconnect(self.keyboard, delay, session_id, self.reattach_command)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+enum LoopStart {
+    Fresh,
+    Connection(quinn::Connection),
+    Stun {
+        conn: quinn::Connection,
+        ctx: StunReconnectContext,
+    },
+}
+
+struct SessionLoopConfig<'a> {
+    addr: SocketAddr,
+    server_name: &'a str,
+    client_config: quinn::ClientConfig,
+    start: LoopStart,
+    session_id: Option<[u8; 16]>,
+    reattach_command: String,
+    retry: RetryPolicy,
+    pairing_code: Option<String>,
 }
 
 /// Core reconnection loop. If `first_conn` is provided, skips the connect
@@ -393,19 +561,23 @@ async fn receive_session_id(session: &mut ClientSession) -> anyhow::Result<Sessi
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn client_session_loop_inner(
-    addr: SocketAddr,
-    server_name: &str,
-    client_config: quinn::ClientConfig,
-    first_conn: Option<quinn::Connection>,
-    stun_ctx: Option<StunReconnectContext>,
-    mut session_id: Option<[u8; 16]>,
-    reattach_command: String,
-) -> anyhow::Result<()> {
-    let mut backoff = Duration::from_millis(100);
-    let mut initial_conn = first_conn;
-    const MAX_INITIAL_RETRIES: u32 = 10;
-    let mut initial_retries: u32 = 0;
+async fn client_session_loop_inner(config: SessionLoopConfig<'_>) -> anyhow::Result<()> {
+    let SessionLoopConfig {
+        addr,
+        server_name,
+        client_config,
+        start,
+        mut session_id,
+        reattach_command,
+        retry,
+        pairing_code,
+    } = config;
+    let (mut initial_conn, stun_ctx) = match start {
+        LoopStart::Fresh => (None, None),
+        LoopStart::Connection(conn) => (Some(conn), None),
+        LoopStart::Stun { conn, ctx } => (Some(conn), Some(ctx)),
+    };
+    let mut failed_attempts: u32 = 0;
 
     // Persistent client screen state across reconnects so the user sees
     // the last known content instead of a blank screen while reconnecting.
@@ -414,26 +586,14 @@ async fn client_session_loop_inner(
     let (key_tx, key_rx) = tokio::sync::mpsc::channel(128);
     let keyboard = KeyboardInput::new(key_rx);
     std::thread::spawn(move || read_keyboard_events(key_tx));
+    let failure = ConnectFailureCtx {
+        keyboard: &keyboard,
+        retry,
+        reattach_command: &reattach_command,
+        pairing_code: pairing_code.as_deref(),
+    };
 
     loop {
-        if session_id.is_none() && initial_conn.is_none() {
-            initial_retries += 1;
-            if initial_retries > MAX_INITIAL_RETRIES {
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(b"\r\n[RoSE: could not connect to server, giving up]\r\n");
-                let _ = stdout.flush();
-                anyhow::bail!("failed to connect after {MAX_INITIAL_RETRIES} attempts");
-            }
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(
-                format!(
-                    "\r\n[RoSE: connection failed, retrying ({initial_retries}/{MAX_INITIAL_RETRIES})...]\r\n"
-                )
-                .as_bytes(),
-            );
-            let _ = stdout.flush();
-        }
-
         let mut _live_client: Option<QuicClient> = None;
 
         let conn = if let Some(conn) = initial_conn.take() {
@@ -451,34 +611,39 @@ async fn client_session_loop_inner(
                             c
                         }
                         Ok(Err(e)) => {
-                            tracing::debug!(?backoff, "STUN reconnect failed: {e}");
-                            if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command)
+                            let kind = classify_transport(&e);
+                            if failure
+                                .report(session_id, &mut failed_attempts, e.into(), kind)
                                 .await?
                             {
                                 break Ok(());
                             }
-                            backoff = (backoff * 2).min(Duration::from_secs(5));
                             continue;
                         }
                         Err(_) => {
-                            tracing::debug!(?backoff, "STUN reconnect timed out");
-                            if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command)
+                            if failure
+                                .report(
+                                    session_id,
+                                    &mut failed_attempts,
+                                    anyhow::anyhow!("connection timed out"),
+                                    ConnectFailureKind::Transient,
+                                )
                                 .await?
                             {
                                 break Ok(());
                             }
-                            backoff = (backoff * 2).min(Duration::from_secs(5));
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(?backoff, "STUN rediscovery failed: {e}");
-                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    let kind = classify_anyhow(&e);
+                    if failure
+                        .report(session_id, &mut failed_attempts, e, kind)
+                        .await?
                     {
                         break Ok(());
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
             }
@@ -486,12 +651,17 @@ async fn client_session_loop_inner(
             let client = match QuicClient::new() {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::debug!(?backoff, "failed to create endpoint: {e}");
-                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    if failure
+                        .report(
+                            session_id,
+                            &mut failed_attempts,
+                            e.into(),
+                            ConnectFailureKind::Transient,
+                        )
+                        .await?
                     {
                         break Ok(());
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
             };
@@ -505,21 +675,27 @@ async fn client_session_loop_inner(
                     c
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[RoSE: {e}]");
-                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    let kind = classify_transport(&e);
+                    if failure
+                        .report(session_id, &mut failed_attempts, e.into(), kind)
+                        .await?
                     {
                         break Ok(());
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
                 Err(_) => {
-                    eprintln!("[RoSE: connection timed out]");
-                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    if failure
+                        .report(
+                            session_id,
+                            &mut failed_attempts,
+                            anyhow::anyhow!("connection timed out"),
+                            ConnectFailureKind::Transient,
+                        )
+                        .await?
                     {
                         break Ok(());
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
             }
@@ -531,42 +707,63 @@ async fn client_session_loop_inner(
             match ClientSession::reconnect(conn, rows, cols, sid, env).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!(?backoff, "reconnect handshake failed: {e}");
-                    if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await?
+                    let err = anyhow::Error::from(e);
+                    let kind = classify_anyhow(&err);
+                    if failure
+                        .report(session_id, &mut failed_attempts, err, kind)
+                        .await?
                     {
                         break Ok(());
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                     continue;
                 }
             }
         } else {
-            ClientSession::connect(conn, rows, cols, env).await?
+            match ClientSession::connect(conn, rows, cols, env).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let err = anyhow::Error::from(e);
+                    let kind = classify_anyhow(&err);
+                    if failure
+                        .report(session_id, &mut failed_attempts, err, kind)
+                        .await?
+                    {
+                        break Ok(());
+                    }
+                    continue;
+                }
+            }
         };
 
-        match receive_session_id(&mut session).await? {
+        match receive_session_id(&mut session, Some(&keyboard)).await? {
             SessionHandshake::Ready(sid) => session_id = Some(sid),
             SessionHandshake::Unavailable => {
-                eprintln!("[RoSE: remote session no longer exists]");
+                rose_status("remote session no longer exists");
                 break Ok(());
             }
             SessionHandshake::Retry => {
-                tracing::debug!(?backoff, "handshake timed out");
-                if wait_or_disconnect(&keyboard, backoff, session_id, &reattach_command).await? {
+                if failure
+                    .report(
+                        session_id,
+                        &mut failed_attempts,
+                        anyhow::anyhow!("handshake timed out"),
+                        ConnectFailureKind::Transient,
+                    )
+                    .await?
+                {
                     break Ok(());
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
                 continue;
             }
         }
 
-        let is_reconnect = session_id.is_some() && backoff > Duration::from_millis(100);
+        let is_reconnect = failed_attempts > 0;
         if is_reconnect {
             tracing::info!("reconnected");
         } else {
             tracing::info!("connected");
         }
-        backoff = Duration::from_millis(100);
+        failed_attempts = 0;
 
         // Only clear the screen on first connect. On reconnect, preserve
         // the last known content so the user doesn't see a blank screen.
@@ -1033,7 +1230,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            receive_session_id(&mut session).await.unwrap(),
+            receive_session_id(&mut session, None).await.unwrap(),
             SessionHandshake::Unavailable
         );
         let _ = release.send(());
@@ -1060,7 +1257,44 @@ mod tests {
         let mut session = ClientSession::connect(client, 24, 80, vec![])
             .await
             .unwrap();
-        assert!(receive_session_id(&mut session).await.is_err());
+        assert!(receive_session_id(&mut session, None).await.is_err());
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_required_then_session_info_completes_handshake() {
+        let (client, server, _fixture, _endpoint) = crate::testutil::connected_pair().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut session, _) = crate::protocol::ServerSession::accept_any(server)
+                .await
+                .unwrap();
+            session
+                .send_control(&ControlMessage::AuthRequired {
+                    pairing_code: Some("44".into()),
+                    pairing_ttl_secs: 15,
+                    sso_uri: None,
+                    sso_user_code: None,
+                })
+                .await
+                .unwrap();
+            session
+                .send_control(&ControlMessage::SessionInfo {
+                    version: PROTOCOL_VERSION,
+                    session_id: [0x66; 16],
+                })
+                .await
+                .unwrap();
+            let _ = released.await;
+        });
+        let mut session = ClientSession::connect(client, 24, 80, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_session_id(&mut session, None).await.unwrap(),
+            SessionHandshake::Ready([0x66; 16])
+        );
         let _ = release.send(());
         server.await.unwrap();
     }

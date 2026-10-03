@@ -44,11 +44,18 @@ let
   settingsFile = (pkgs.formats.toml { }).generate "rose-config.toml" (
     lib.filterAttrs (_: value: value != null) {
       require_ca_certs = cfg.requireCaCerts;
+      require_client_certs = cfg.requireClientCerts;
       stun_servers = cfg.stunServers;
       max_sessions = cfg.maxSessions;
       # A missing key in an existing file disables idle pruning. Always write
       # the default so an absent Nix value does not change the server default.
       session_idle_timeout_secs = cfg.sessionIdleTimeoutSecs;
+      pairing = cfg.pairing;
+      pairing_code_digits = cfg.pairingCodeDigits;
+      totp_required = cfg.totpRequired;
+      sso_issuer = cfg.ssoIssuer;
+      sso_client_id = cfg.ssoClientId;
+      sso_client_secret = cfg.ssoClientSecret;
     }
   );
 
@@ -222,10 +229,11 @@ in
         The server only loads files whose names end in `.crt`.
         A source named `client.crt.der` is installed as `client.crt`.
         Files already in that directory are left in place.
-        The server reads the directory at startup, so adding a certificate
-        restarts the service when it changes this option.
+        Changing this option copies the listed files and restarts the
+        service. Dropping or deleting a `.crt` in that directory takes
+        effect immediately without a restart.
         An empty directory still lets the service listen. Every client is
-        refused until a certificate is added and the service is restarted.
+        refused until a matching `.crt` is present.
       '';
     };
 
@@ -237,6 +245,62 @@ in
         The daemon does not consult this flag. It is recorded so the file
         matches RoSE's configuration schema.
       '';
+    };
+
+    requireClientCerts = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Value of `require_client_certs` in the server's `config.toml`.
+        When `true`, clients must present a certificate listed in
+        `authorized_certs/`. When `false`, any client may connect.
+        The running server rereads this key; `rose ctl set` applies it
+        until the next NixOS activation overwrites `config.toml`.
+      '';
+    };
+
+    pairing = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Value of `pairing` in `config.toml`.
+        When `true`, unauthorized clients receive a numeric pairing code
+        over the control channel instead of a TLS reject.
+      '';
+    };
+
+    pairingCodeDigits = lib.mkOption {
+      type = lib.types.ints.between 2 18;
+      default = 8;
+      description = "Length of numeric pairing codes (2–18, default 8).";
+    };
+
+    totpRequired = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Value of `totp_required` in `config.toml`.
+        When `true`, each new login must present a TOTP code.
+      '';
+    };
+
+    ssoIssuer = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://idp.example/realms/rose";
+      description = "OpenID Connect issuer URL (`sso_issuer`).";
+    };
+
+    ssoClientId = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "OIDC client id for the device-authorization grant.";
+    };
+
+    ssoClientSecret = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional OIDC client secret.";
     };
 
     stunServers = lib.mkOption {
@@ -334,6 +398,7 @@ in
       "d ${cfg.home}/.config 0700 ${cfg.user} ${cfg.group} - -"
       "d ${cfg.home}/.config/rose 0700 ${cfg.user} ${cfg.group} - -"
       "d ${cfg.home}/.config/rose/authorized_certs 0700 ${cfg.user} ${cfg.group} - -"
+      "d ${cfg.home}/.config/rose/pending_certs 0700 ${cfg.user} ${cfg.group} - -"
     ];
 
     systemd.services.rose = {

@@ -1364,9 +1364,9 @@ async fn native_reconnect_backoff_resets_only_after_session_info() {
             }
             _ => {
                 let minimum_ms = match attempt {
-                    1 => 200,
-                    2 => 400,
-                    _ => 100,
+                    1 => 1000,
+                    2 => 2000,
+                    _ => 1000,
                 };
                 previous_failure = Some((std::time::Instant::now(), minimum_ms));
                 conn.close(1u32.into(), b"session metadata temporarily unavailable");
@@ -1376,10 +1376,10 @@ async fn native_reconnect_backoff_resets_only_after_session_info() {
     let captured = pty.finish();
     let retries: Vec<_> = captured
         .lines()
-        .filter(|line| line.contains("handshake timed out"))
+        .filter(|line| line.contains("retrying in"))
         .collect();
     assert_eq!(retries.len(), 4, "{captured}");
-    for (retry, expected) in retries.iter().zip(["100ms", "200ms", "400ms", "100ms"]) {
+    for (retry, expected) in retries.iter().zip(["1s", "2s", "3s", "1s"]) {
         assert!(retry.contains(expected), "{retry} did not use {expected}");
     }
 }
@@ -1917,6 +1917,7 @@ async fn native_mode_mutual_tls_auth() {
             "127.0.0.1:0".parse().unwrap(),
             generate_self_signed_cert(&["localhost".to_string()]).unwrap(),
             &auth_dir,
+            &dir,
         )
         .unwrap();
         let addr = server.local_addr().unwrap();
@@ -1947,6 +1948,7 @@ async fn native_mode_mutual_tls_auth() {
             "127.0.0.1:0".parse().unwrap(),
             generate_self_signed_cert(&["localhost".to_string()]).unwrap(),
             &auth_dir,
+            &dir,
         )
         .unwrap();
         let addr = server.local_addr().unwrap();

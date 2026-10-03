@@ -329,8 +329,14 @@ mod windows {
         remove_service()?;
         let source = std::env::current_exe()?;
         copy_binary(&source, &plan.layout.executable)?;
-        std::fs::create_dir_all(plan.layout.config_dir.join("authorized_certs"))
-            .map_err(|error| io_error(error, "create the RoSE config directory"))?;
+        crate::config::RoseConfig::ensure_dir(&plan.layout.config_dir).map_err(
+            |error| match error {
+                crate::config::ConfigError::Io(io) => {
+                    io_error(io, "create the RoSE config directory")
+                }
+                other => anyhow::anyhow!("failed to create the RoSE config directory: {other}"),
+            },
+        )?;
 
         create_service(&plan.layout.executable, &plan.launch_arguments)?;
         run_powershell(&plan.firewall_script, "add the RoSE firewall rule")?;
@@ -738,33 +744,42 @@ mod tests {
         let plan = plan("0.0.0.0:4433", &["rose.example"]);
         assert_eq!(
             plan.layout.executable,
-            PathBuf::from(r"C:\Program Files\RoSE\rose.exe")
+            Path::new(r"C:\Program Files").join("RoSE").join("rose.exe")
         );
         assert_eq!(
             plan.layout.config_dir,
-            PathBuf::from(r"C:\ProgramData\RoSE")
+            Path::new(r"C:\ProgramData").join("RoSE")
         );
         assert_eq!(
             plan.launch_arguments,
             vec![
-                "service",
-                "run",
-                "--listen",
-                "0.0.0.0:4433",
-                "--config-dir",
-                r"C:\ProgramData\RoSE",
-                "--hostname",
-                "rose.example",
+                "service".to_string(),
+                "run".to_string(),
+                "--listen".to_string(),
+                "0.0.0.0:4433".to_string(),
+                "--config-dir".to_string(),
+                Path::new(r"C:\ProgramData")
+                    .join("RoSE")
+                    .display()
+                    .to_string(),
+                "--hostname".to_string(),
+                "rose.example".to_string(),
             ]
         );
         assert!(plan.firewall_script.contains("-Protocol UDP"));
         assert!(plan.firewall_script.contains("-LocalPort 4433"));
         assert!(plan.firewall_script.contains("-Direction Inbound"));
         assert!(plan.firewall_script.contains("-Action Allow"));
-        assert!(
-            plan.firewall_script
-                .contains(r"-Program 'C:\Program Files\RoSE\rose.exe'")
-        );
+        assert!(plan.firewall_script.contains(&format!(
+                "-Program {}",
+                super::powershell_literal(
+                    &Path::new(r"C:\Program Files")
+                        .join("RoSE")
+                        .join("rose.exe")
+                        .display()
+                        .to_string()
+                )
+            )));
         assert!(!plan.firewall_script.contains("-LocalAddress"));
         assert!(plan.summary.contains("UDP"));
         assert!(plan.summary.contains("LocalSystem"));
@@ -779,12 +794,15 @@ mod tests {
         assert_eq!(
             plan.launch_arguments,
             vec![
-                "service",
-                "run",
-                "--listen",
-                "[2001:db8::1]:9443",
-                "--config-dir",
-                r"C:\ProgramData\RoSE",
+                "service".to_string(),
+                "run".to_string(),
+                "--listen".to_string(),
+                "[2001:db8::1]:9443".to_string(),
+                "--config-dir".to_string(),
+                Path::new(r"C:\ProgramData")
+                    .join("RoSE")
+                    .display()
+                    .to_string(),
             ]
         );
     }
@@ -815,8 +833,22 @@ mod tests {
         assert!(script.contains("Remove-NetFirewallRule"));
         assert!(!script.contains("New-NetFirewallRule"));
         let summary = uninstall_summary(&layout);
-        assert!(summary.contains(r"C:\Program Files\RoSE"));
-        assert!(summary.contains(r"C:\ProgramData\RoSE"));
+        assert!(
+            summary.contains(
+                &Path::new(r"C:\Program Files")
+                    .join("RoSE")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            summary.contains(
+                &Path::new(r"C:\ProgramData")
+                    .join("RoSE")
+                    .display()
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -848,13 +880,13 @@ mod tests {
         .map(str::to_string);
         assert_eq!(
             service_log_path(&args),
-            Some(PathBuf::from(r"C:\ProgramData\RoSE\service.log"))
+            Some(Path::new(r"C:\ProgramData\RoSE").join("service.log"))
         );
 
         let equals = ["rose", "service", "run", r"--config-dir=D:\rose"].map(str::to_string);
         assert_eq!(
             service_log_path(&equals),
-            Some(PathBuf::from(r"D:\rose\service.log"))
+            Some(Path::new(r"D:\rose").join("service.log"))
         );
         assert_eq!(
             service_log_path(&["rose".to_string(), "server".to_string()]),
