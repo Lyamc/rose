@@ -16,8 +16,7 @@ pub(super) const SERVICE_NAME: &str = "RoSE";
 pub(super) const SERVICE_DISPLAY_NAME: &str = "RoSE Server";
 
 /// Description stored on the service.
-pub(super) const SERVICE_DESCRIPTION: &str =
-    "Remote Shell Environment server. Accepts QUIC on UDP and runs sessions as LocalSystem.";
+pub(super) const SERVICE_DESCRIPTION: &str = "Remote Shell Environment server. Accepts QUIC on UDP. The service runs as LocalSystem; shells run as the Windows user who approved the client.";
 
 /// Stable Windows Firewall rule name.
 pub(super) const FIREWALL_RULE_NAME: &str = "RoSE";
@@ -122,6 +121,60 @@ pub(super) fn prepare_install(
     })
 }
 
+/// Filesystem layout for `rose service install --user`.
+///
+/// The binary lives under `%LOCALAPPDATA%`. Config lives under `%APPDATA%`
+/// so uninstall can delete the binary and leave the certificates.
+#[must_use]
+pub(super) fn user_layout(local_app_data: &Path, app_data: &Path) -> ServiceLayout {
+    let install_dir = local_app_data.join(DATA_DIR_NAME);
+    ServiceLayout {
+        executable: install_dir.join(EXECUTABLE_NAME),
+        install_dir,
+        config_dir: app_data.join(DATA_DIR_NAME),
+    }
+}
+
+/// Arguments after `rose.exe` for a user logon server.
+#[must_use]
+pub(super) fn user_server_arguments(
+    listen: SocketAddr,
+    config_dir: &Path,
+    hostnames: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "server".to_string(),
+        "--listen".to_string(),
+        listen.to_string(),
+        "--config-dir".to_string(),
+        config_dir.display().to_string(),
+    ];
+    for hostname in hostnames {
+        args.push("--hostname".to_string());
+        args.push(hostname.clone());
+    }
+    args
+}
+
+/// Text printed after a user install.
+#[must_use]
+pub(super) fn user_install_summary(layout: &ServiceLayout, listen: SocketAddr) -> String {
+    format!(
+        "Installed RoSE for the current user.\n\
+         Binary: {}\n\
+         User PATH: {}\n\
+         Listen: {listen} (UDP)\n\
+         Config: {}\n\
+         The server starts at logon as this user. Shells run as this user.\n\
+         Elevation is not available. Install without --user for a system service that can elevate and that starts before logon.\n\
+         Place client certificates in {}.",
+        layout.executable.display(),
+        layout.install_dir.display(),
+        layout.config_dir.display(),
+        layout.config_dir.join("authorized_certs").display(),
+    )
+}
+
 /// Arguments for `sc.exe failure` so a crashed service restarts up to three times.
 #[must_use]
 pub(super) fn service_failure_args(service_name: &str) -> Vec<String> {
@@ -162,11 +215,16 @@ pub(super) fn firewall_remove_script() -> String {
 
 /// Text printed after uninstall. Configuration is intentionally kept.
 #[must_use]
-pub(super) fn uninstall_summary(layout: &ServiceLayout) -> String {
+pub(super) fn uninstall_summary(system: &ServiceLayout, user: &ServiceLayout) -> String {
     format!(
-        "Removed the {SERVICE_DISPLAY_NAME} service, its firewall rule, its system PATH entry, and {}.\nLeft configuration in place at {}.",
-        layout.install_dir.display(),
-        layout.config_dir.display(),
+        "Removed the {SERVICE_DISPLAY_NAME} service when this command could change it, the {SERVICE_NAME} logon task, its firewall rule, and its system PATH entry.\n\
+         System binary directory: {}\n\
+         User binary directory: {}\n\
+         Left configuration in place at {} and {}.",
+        system.install_dir.display(),
+        user.install_dir.display(),
+        system.config_dir.display(),
+        user.config_dir.display(),
     )
 }
 
@@ -249,14 +307,22 @@ fn path_entry_key(entry: &str) -> String {
 ///
 /// Returns an error on non-Windows platforms, when the listen port is 0, or
 /// when creating the service or firewall rule fails.
-pub(super) fn install(listen: SocketAddr, hostnames: Vec<String>) -> anyhow::Result<()> {
+pub(super) fn install(
+    listen: SocketAddr,
+    hostnames: Vec<String>,
+    user: bool,
+) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        windows::install(listen, &hostnames)
+        if user {
+            windows::install_user(listen, &hostnames)
+        } else {
+            windows::install(listen, &hostnames)
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = (listen, hostnames);
+        let _ = (listen, hostnames, user);
         anyhow::bail!("installing the RoSE service is only supported on Windows");
     }
 }
@@ -336,7 +402,10 @@ fn install_summary(layout: &ServiceLayout, listen: SocketAddr) -> String {
          Listen: {listen} (UDP)\n\
          Firewall rule: {FIREWALL_RULE_DISPLAY} ({FIREWALL_RULE_NAME})\n\
          Config: {}\n\
-         The service account is LocalSystem, and the service starts automatically.\n\
+         The service process runs as LocalSystem and starts before anyone logs on.\n\
+         Shells run as the Windows user who approved the client, not as LocalSystem.\n\
+         `rose connect --elevate` opens an elevated shell without a consent prompt.\n\
+         `rose connect --system` opens a LocalSystem shell when windows_root_access is true.\n\
          Open a new terminal to pick up the PATH change.\n\
          Place client certificates in {}.",
         layout.executable.display(),
@@ -404,6 +473,7 @@ mod windows {
         let program_data = env_dir("ProgramData", r"C:\ProgramData");
         let plan = prepare_install(&program_files, &program_data, listen, hostnames)?;
         // Stop a previous service before replacing its executable. Windows locks a running image.
+        stop_logon_task();
         remove_service()?;
         let source = std::env::current_exe()?;
         copy_binary(&source, &plan.layout.executable)?;
@@ -421,20 +491,175 @@ mod windows {
         update_system_path(&plan.layout.install_dir, true)?;
         configure_restart()?;
         start_service()?;
+        if let Err(error) = register_event_source() {
+            eprintln!("warning: {error}");
+        }
         eprintln!("{}", plan.summary);
         Ok(())
     }
 
+    pub(super) fn install_user(listen: SocketAddr, hostnames: &[String]) -> anyhow::Result<()> {
+        if listen.port() == 0 {
+            return Err(super::ListenPortError.into());
+        }
+        ensure_system_service_absent()?;
+        let local_app_data = env_dir("LOCALAPPDATA", r"C:\Users\Default\AppData\Local");
+        let app_data = env_dir("APPDATA", r"C:\Users\Default\AppData\Roaming");
+        let layout = super::user_layout(&local_app_data, &app_data);
+        let arguments = super::user_server_arguments(listen, &layout.config_dir, hostnames);
+        stop_logon_task();
+        let source = std::env::current_exe()?;
+        copy_binary(&source, &layout.executable)?;
+        crate::config::RoseConfig::ensure_dir(&layout.config_dir).map_err(|error| {
+            anyhow::anyhow!("failed to create the RoSE config directory: {error}")
+        })?;
+        let local_ip = super::specified_ip(listen.ip());
+        let script =
+            super::firewall_replace_script(listen.port(), &layout.executable, local_ip.as_deref());
+        if let Err(error) = run_powershell(&script, "add the RoSE firewall rule") {
+            eprintln!(
+                "warning: the firewall rule was not added ({error}). A user install does not require elevation."
+            );
+        }
+        update_user_path(&layout.install_dir, true)?;
+        run_command(
+            "schtasks",
+            &crate::shell_account::schtasks_create_args(&layout.executable, &arguments),
+            "create the RoSE logon task",
+        )?;
+        run_command(
+            "schtasks",
+            &crate::shell_account::schtasks_run_args(),
+            "start the RoSE logon task",
+        )?;
+        eprintln!("{}", super::user_install_summary(&layout, listen));
+        Ok(())
+    }
+
     pub(super) fn uninstall() -> anyhow::Result<()> {
+        let system = remove_system_install();
+        let user = remove_user_install();
+        system.and(user)
+    }
+
+    fn remove_system_install() -> anyhow::Result<()> {
         let program_files = env_dir("ProgramFiles", r"C:\Program Files");
         let program_data = env_dir("ProgramData", r"C:\ProgramData");
         let layout = service_layout(&program_files, &program_data);
-        remove_service()?;
-        run_powershell(&firewall_remove_script(), "remove the RoSE firewall rule")?;
-        let path_result = update_system_path(&layout.install_dir, false);
-        let files_result = remove_installed_files(&layout);
+        let service_result = warn_unless_access_denied(remove_service());
+        let firewall_result = warn_unless_access_denied(run_powershell(
+            &firewall_remove_script(),
+            "remove the RoSE firewall rule",
+        ));
+        let path_result = warn_unless_access_denied(update_system_path(&layout.install_dir, false));
+        let files_result = warn_unless_access_denied(remove_installed_files(&layout));
+        service_result
+            .and(firewall_result)
+            .and(path_result)
+            .and(files_result)?;
+        Ok(())
+    }
+
+    fn remove_user_install() -> anyhow::Result<()> {
+        stop_logon_task();
+        let local_app_data = env_dir("LOCALAPPDATA", r"C:\Users\Default\AppData\Local");
+        let app_data = env_dir("APPDATA", r"C:\Users\Default\AppData\Roaming");
+        let user = super::user_layout(&local_app_data, &app_data);
+        let program_files = env_dir("ProgramFiles", r"C:\Program Files");
+        let program_data = env_dir("ProgramData", r"C:\ProgramData");
+        let system = service_layout(&program_files, &program_data);
+        let path_result = update_user_path(&user.install_dir, false);
+        let files_result = remove_installed_files(&user);
         path_result.and(files_result)?;
-        eprintln!("{}", uninstall_summary(&layout));
+        eprintln!("{}", uninstall_summary(&system, &user));
+        Ok(())
+    }
+
+    fn stop_logon_task() {
+        let _ = run_command(
+            "schtasks",
+            &crate::shell_account::schtasks_end_args(),
+            "stop the RoSE logon task",
+        );
+        let _ = run_command(
+            "schtasks",
+            &crate::shell_account::schtasks_delete_args(),
+            "remove the RoSE logon task",
+        );
+    }
+
+    fn ensure_system_service_absent() -> anyhow::Result<()> {
+        let manager = match ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT,
+        ) {
+            Ok(manager) => manager,
+            Err(error) if winapi_code(&error) == Some(ERROR_ACCESS_DENIED) => {
+                eprintln!(
+                    "warning: could not check for a RoSE system service. If one is installed, stop it before this user server binds the same UDP port."
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(service_error(error)),
+        };
+        match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Err(error) if winapi_code(&error) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => Ok(()),
+            Err(error) if winapi_code(&error) == Some(ERROR_ACCESS_DENIED) => {
+                anyhow::bail!(
+                    "a RoSE service may already be installed. From an elevated prompt run `rose service uninstall` before `rose service install --user`"
+                );
+            }
+            Ok(_) => anyhow::bail!(
+                "the RoSE system service is already installed. From an elevated prompt run `rose service uninstall` before `rose service install --user`"
+            ),
+            Err(error) => Err(service_error(error)),
+        }
+    }
+
+    fn warn_unless_access_denied(result: anyhow::Result<()>) -> anyhow::Result<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("access denied") =>
+            {
+                eprintln!("warning: {error}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn update_user_path(install_dir: &std::path::Path, include: bool) -> anyhow::Result<()> {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+
+        let environment = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey("Environment")
+            .map_err(|error| io_error(error, "open the user PATH registry key"))?
+            .0;
+        write_path_value(&environment, install_dir, include, "user PATH")
+    }
+
+    fn register_event_source() -> anyhow::Result<()> {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_EXPAND_SZ};
+        use winreg::types::ToRegValue;
+
+        let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .create_subkey_with_flags(
+                r"SYSTEM\CurrentControlSet\Services\EventLog\Application\RoSE",
+                KEY_SET_VALUE,
+            )
+            .map_err(|error| io_error(error, "register the RoSE event source"))?;
+        let mut message = r"%SystemRoot%\System32\EventCreate.exe".to_reg_value();
+        message.vtype = REG_EXPAND_SZ;
+        key.set_raw_value("EventMessageFile", &message)
+            .map_err(|error| io_error(error, "set the RoSE event message file"))?;
+        key.set_value("TypesSupported", &7u32)
+            .map_err(|error| io_error(error, "set the RoSE event types"))?;
         Ok(())
     }
 
@@ -445,8 +670,7 @@ mod windows {
     /// `%SystemRoot%` and could store the result as a plain string.
     fn update_system_path(install_dir: &std::path::Path, include: bool) -> anyhow::Result<()> {
         use winreg::RegKey;
-        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ};
-        use winreg::types::{FromRegValue, ToRegValue};
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
 
         let environment = RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey_with_flags(
@@ -454,19 +678,31 @@ mod windows {
                 KEY_READ | KEY_SET_VALUE,
             )
             .map_err(|error| io_error(error, "open the system PATH registry key"))?;
+        write_path_value(&environment, install_dir, include, "system PATH")
+    }
+
+    fn write_path_value(
+        environment: &winreg::RegKey,
+        install_dir: &std::path::Path,
+        include: bool,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        use winreg::enums::{REG_EXPAND_SZ, REG_SZ};
+        use winreg::types::{FromRegValue, ToRegValue};
+
         let (path, value_type) = match environment.get_raw_value("Path") {
             Ok(value) => {
                 if !matches!(value.vtype, REG_SZ | REG_EXPAND_SZ) {
-                    anyhow::bail!("the system PATH registry value is not a string");
+                    anyhow::bail!("the {label} registry value is not a string");
                 }
                 let path = String::from_reg_value(&value)
-                    .map_err(|error| io_error(error, "decode the system PATH"))?;
+                    .map_err(|error| io_error(error, &format!("decode the {label}")))?;
                 (path, value.vtype)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 (String::new(), REG_EXPAND_SZ)
             }
-            Err(error) => return Err(io_error(error, "read the system PATH")),
+            Err(error) => return Err(io_error(error, &format!("read the {label}"))),
         };
         let dir = install_dir.display().to_string();
         let updated = if include {
@@ -481,10 +717,10 @@ mod windows {
         written.vtype = value_type;
         environment
             .set_raw_value("Path", &written)
-            .map_err(|error| io_error(error, "update the system PATH"))?;
+            .map_err(|error| io_error(error, &format!("update the {label}")))?;
         run_powershell(
             environment_change_script(),
-            "notify Windows that the system PATH changed",
+            "notify Windows that PATH changed",
         )
     }
 
@@ -967,10 +1203,23 @@ mod tests {
         assert!(script.contains("-Name 'RoSE'"));
         assert!(script.contains("Remove-NetFirewallRule"));
         assert!(!script.contains("New-NetFirewallRule"));
-        let summary = uninstall_summary(&layout);
+        let user = user_layout(
+            Path::new(r"C:\Users\Lyam\AppData\Local"),
+            Path::new(r"C:\Users\Lyam\AppData\Roaming"),
+        );
+        let summary = uninstall_summary(&layout, &user);
         assert!(
             summary.contains(
                 &Path::new(r"C:\Program Files")
+                    .join("RoSE")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(summary.contains("logon task"));
+        assert!(
+            summary.contains(
+                &Path::new(r"C:\Users\Lyam\AppData\Local")
                     .join("RoSE")
                     .display()
                     .to_string()
@@ -985,6 +1234,16 @@ mod tests {
             )
         );
         assert!(summary.contains("system PATH"));
+        let listen = "0.0.0.0:4433".parse().unwrap();
+        let arguments = user_server_arguments(listen, &user.config_dir, &["host".to_string()]);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--hostname", "host"])
+        );
+        let user_summary = user_install_summary(&user, listen);
+        assert!(user_summary.contains("starts at logon"));
+        assert!(SERVICE_DESCRIPTION.contains("LocalSystem"));
     }
 
     #[test]

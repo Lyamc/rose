@@ -1,9 +1,7 @@
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use portable_pty::CommandBuilder;
+use std::time::{Duration, SystemTime};
 
 use super::util::{
     FrameSendResult, SspFrameSender, extract_peer_cert, hex_decode, hex_encode, parse_stun_line,
@@ -59,12 +57,13 @@ pub(super) async fn run_server(
     listen: SocketAddr,
     bootstrap: bool,
     hostname: Vec<String>,
+    config_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     run_server_at(
         listen,
         bootstrap,
         hostname,
-        RosePaths::resolve(),
+        RosePaths::resolve_optional(config_dir),
         None,
         std::future::pending(),
     )
@@ -227,32 +226,58 @@ pub(super) async fn run_server_at(
             if store.is_empty()
                 && let Some(timeout) = store.final_screen_timeout()
             {
-                match tokio::time::timeout(timeout, server.accept()).await {
+                match tokio::time::timeout(timeout, server.next_incoming()).await {
                     Ok(result) => result,
                     Err(_) => break,
                 }
             } else {
-                server.accept().await
+                server.next_incoming().await
             }
         } else {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break,
-                result = server.accept() => result,
+                result = server.next_incoming() => result,
             }
         };
-        let conn = match incoming {
-            Ok(Some(conn)) => conn,
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!("accept failed: {e}");
+        let Some(incoming) = incoming else {
+            break;
+        };
+        let peer = incoming.remote_address();
+        let local = incoming.local_ip();
+        tracing::info!(%peer, ?local, "new connection");
+        let rose_config = config::RoseConfig::load(&paths.config_dir).unwrap_or_default();
+        let settings = crate::auth_guard::GuardSettings::from_config(&rose_config);
+        let access = crate::auth_guard::begin_connection(
+            &paths.config_dir,
+            &settings,
+            peer.ip(),
+            SystemTime::now(),
+        );
+        let delay = match access {
+            crate::auth_guard::Access::Banned(ban) => {
+                let detail = match ban {
+                    crate::auth_guard::BanLength::Permanent => "permanent ban".to_string(),
+                    crate::auth_guard::BanLength::Timed(duration) => {
+                        format!("banned for {}s", duration.as_secs())
+                    }
+                };
+                record_login(
+                    &paths,
+                    &rose_config,
+                    peer,
+                    local,
+                    "unknown client",
+                    "banned",
+                    &detail,
+                );
+                incoming.refuse();
                 continue;
             }
+            crate::auth_guard::Access::Delay(delay) => delay,
+            crate::auth_guard::Access::Allow => Duration::ZERO,
         };
-        let peer = conn.remote_address();
-        tracing::info!(%peer, "new connection");
 
-        let rose_config = config::RoseConfig::load(&paths.config_dir).unwrap_or_default();
         if let Some(timeout) = rose_config
             .session_idle_timeout_secs
             .map(Duration::from_secs)
@@ -265,8 +290,18 @@ pub(super) async fn run_server_at(
         let _ = store.prune_exited();
 
         if bootstrap {
-            if let Err(e) = handle_server_session(conn, store.clone(), true, paths.clone()).await {
-                tracing::error!(%peer, "session error: {e}");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            match incoming.await {
+                Ok(conn) => {
+                    if let Err(error) =
+                        serve_connection(conn, store.clone(), true, paths.clone()).await
+                    {
+                        tracing::error!(%peer, "session error: {error}");
+                    }
+                }
+                Err(error) => note_rejected_handshake(&paths, &rose_config, peer, local, &error),
             }
             if store.is_empty() && store.final_screen_timeout().is_none() {
                 break;
@@ -277,7 +312,7 @@ pub(super) async fn run_server_at(
                     active_sessions.load(std::sync::atomic::Ordering::Relaxed) + store.len();
                 if total >= limit {
                     tracing::warn!(%peer, total, limit, "max sessions reached, refusing");
-                    conn.close(0u32.into(), b"max sessions reached");
+                    incoming.refuse();
                     continue;
                 }
             }
@@ -286,8 +321,18 @@ pub(super) async fn run_server_at(
             let active = Arc::clone(&active_sessions);
             active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                if let Err(e) = handle_server_session(conn, store, false, paths).await {
-                    tracing::error!(%peer, "session error: {e}");
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                match incoming.await {
+                    Ok(conn) => {
+                        if let Err(error) = serve_connection(conn, store, false, paths).await {
+                            tracing::error!(%peer, "session error: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        note_rejected_handshake(&paths, &rose_config, peer, local, &error);
+                    }
                 }
                 active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
@@ -364,6 +409,102 @@ async fn prepare_reattach(
     Ok(())
 }
 
+/// COVERAGE: The accept loop is covered by the server integration tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn serve_connection(
+    conn: quinn::Connection,
+    store: SessionStore,
+    bootstrap: bool,
+    paths: RosePaths,
+) -> anyhow::Result<()> {
+    let peer = conn.remote_address();
+    let local = conn.local_ip();
+    let who = crate::client_account::describe(
+        &paths.authorized_certs_dir,
+        extract_peer_cert(&conn).as_deref(),
+    );
+    let result = handle_server_session(conn, store, bootstrap, paths.clone()).await;
+    let config = RoseConfig::load(&paths.config_dir).unwrap_or_default();
+    let settings = crate::auth_guard::GuardSettings::from_config(&config);
+    match &result {
+        Ok(()) => {
+            crate::auth_guard::auth_success(&paths.config_dir, peer.ip(), SystemTime::now());
+            record_login(&paths, &config, peer, local, &who, "ok", "session opened");
+        }
+        Err(error) if crate::auth_guard::is_credential_failure(&error.to_string()) => {
+            crate::auth_guard::auth_failure(
+                &paths.config_dir,
+                &settings,
+                peer.ip(),
+                SystemTime::now(),
+            );
+            record_login(
+                &paths,
+                &config,
+                peer,
+                local,
+                &who,
+                "failed",
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            record_login(
+                &paths,
+                &config,
+                peer,
+                local,
+                &who,
+                "closed",
+                &error.to_string(),
+            );
+        }
+    }
+    result
+}
+
+fn note_rejected_handshake(
+    paths: &RosePaths,
+    config: &RoseConfig,
+    peer: SocketAddr,
+    local: Option<IpAddr>,
+    error: &impl std::fmt::Display,
+) {
+    let settings = crate::auth_guard::GuardSettings::from_config(config);
+    let access = crate::auth_guard::rejected_handshake(
+        &paths.config_dir,
+        &settings,
+        peer.ip(),
+        SystemTime::now(),
+    );
+    tracing::warn!(%peer, %error, ?access, "handshake failed");
+    record_login(
+        paths,
+        config,
+        peer,
+        local,
+        "unknown client",
+        "failed",
+        &error.to_string(),
+    );
+}
+
+fn record_login(
+    paths: &RosePaths,
+    config: &RoseConfig,
+    peer: SocketAddr,
+    local: Option<IpAddr>,
+    who: &str,
+    result: &str,
+    detail: &str,
+) {
+    let _ = paths;
+    crate::security_log::emit(
+        config.windows_event_log,
+        &crate::security_log::login_message(result, peer, local, who, detail),
+    );
+}
+
 /// COVERAGE: Tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn new_session(
@@ -371,16 +512,26 @@ async fn new_session(
     rows: u16,
     cols: u16,
     env_vars: &[(String, String)],
+    account: Option<&crate::client_account::ClientAccount>,
+    root_access: bool,
 ) -> anyhow::Result<SessionTuple> {
     let session_id: [u8; 16] = rand_session_id();
     tracing::info!(rows, cols, "new session");
 
-    let filtered = filter_env_vars(env_vars);
-    let mut command = CommandBuilder::new_default_prog();
-    for (key, value) in filtered {
-        command.env(key, value);
-    }
-    let pty = PtySession::open_terminal(rows, cols, command)?;
+    let (request, env_vars) = crate::shell_account::split_shell_request(env_vars);
+    let identity = crate::shell_account::shell_identity(
+        crate::shell_account::current_service_kind()?,
+        request,
+        root_access,
+        account,
+    )?;
+    let filtered = filter_env_vars(&env_vars);
+    tracing::info!(
+        ?identity,
+        user = account.map(crate::client_account::ClientAccount::label),
+        "session account"
+    );
+    let pty = crate::shell_account::open_shell(rows, cols, identity, &filtered, account)?;
     let terminal = Arc::clone(pty.terminal().expect("terminal enabled"));
     let ssp_sender = Arc::new(Mutex::new(SspSender::new()));
 
@@ -474,7 +625,19 @@ async fn wait_for_client_authorization(
                         name
                     };
                     std::fs::create_dir_all(&paths.authorized_certs_dir)?;
-                    std::fs::write(paths.authorized_certs_dir.join(format!("{name}.crt")), cert)?;
+                    let dest = paths.authorized_certs_dir.join(format!("{name}.crt"));
+                    std::fs::write(&dest, cert)?;
+                    let account = crate::client_account::bind_cert(&dest);
+                    let config = RoseConfig::load(&paths.config_dir).unwrap_or_default();
+                    crate::security_log::emit(
+                        config.windows_event_log,
+                        &crate::security_log::pairing_message(
+                            &account.user,
+                            &account.sid,
+                            "sso",
+                            &dest,
+                        ),
+                    );
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -563,7 +726,21 @@ async fn handle_server_session(
             if let Some((session_id, detached)) = detached {
                 reattach_session(&mut session, session_id, detached, rows, cols, &store).await?
             } else {
-                new_session(&mut session, rows, cols, &env_vars).await?
+                let account = peer_cert.as_deref().and_then(|cert| {
+                    crate::client_account::read_for_cert(&paths.authorized_certs_dir, cert)
+                });
+                let root_access = RoseConfig::load(&paths.config_dir)
+                    .unwrap_or_default()
+                    .windows_root_access;
+                new_session(
+                    &mut session,
+                    rows,
+                    cols,
+                    &env_vars,
+                    account.as_ref(),
+                    root_access,
+                )
+                .await?
             }
         }
         ControlMessage::Reconnect {

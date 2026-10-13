@@ -96,14 +96,18 @@ rose service uninstall
 `install` does all of the following:
 
 - Copies `rose.exe` to `%ProgramFiles%\RoSE\rose.exe`.
-- Registers an auto-start service named `RoSE`. The service account is LocalSystem, so every connected shell runs as LocalSystem. Windows restarts the service up to three times if it crashes.
+- Registers an auto-start service named `RoSE`. The service process runs as LocalSystem so it starts before anyone logs on and can elevate. A normal shell runs as the Windows user who approved that client with `rose ctl approve`, not as LocalSystem. `rose connect --elevate` uses that user's elevated token and does not show a consent prompt. `rose connect --system` opens a LocalSystem shell only when `windows_root_access` is true. Windows restarts the service up to three times if it crashes.
 - Adds an inbound UDP firewall rule named `RoSE` for the listen port. QUIC is UDP; a TCP rule does not open the server.
 - Adds `%ProgramFiles%\RoSE` to the system `PATH` when that directory is not already there. The registry value keeps its existing type, so entries such as `%SystemRoot%\system32` stay unexpanded. Terminals that are already open keep their old `PATH` until they are started again.
 - Starts the service after the socket is bound.
 
 Certificates, `config.toml`, and `service.log` are stored in `%ProgramData%\RoSE`. Put each DER client certificate (`client.crt.der` from `rose keygen`) in `%ProgramData%\RoSE\authorized_certs\` and name it with a `.crt` suffix, or use `rose ctl authorize`. `rose ctl` finds that directory by default on Windows. The service listens when that directory is empty and refuses every client until a matching `.crt` is present, unless `require_client_certs` is `false`. Adding or removing a certificate, and `rose ctl set`, take effect immediately; a restart is not required. `--listen` and `--hostname` match `rose server`. A portable layout is a `rose.exe` with `config.toml` beside it; that directory is used instead of `%ProgramData%\RoSE`.
 
-`uninstall` stops the service, deletes the `RoSE` firewall rule, removes `%ProgramFiles%\RoSE` from the system `PATH`, and deletes that directory. It leaves `%ProgramData%\RoSE` in place, including the server certificate and authorized clients.
+`rose service install --user` does not need an elevated prompt. It copies the binary to `%LOCALAPPDATA%\RoSE`, stores config in `%APPDATA%\RoSE`, and starts the server at logon as the current user. That install cannot elevate and does not run before logon. Do not leave a system service installed at the same time; both listen on the same UDP port.
+
+`uninstall` stops the system service and the current user's logon task, deletes the `RoSE` firewall rule, removes the PATH entries it can change, and deletes the copied binaries. It leaves the config directories in place, including certificates and `auth_bans.json`.
+
+Approving a pairing code records the Windows account that ran `rose ctl approve`. Later sessions for that certificate run as that user, and only when that user is logged on. The approval and each login attempt are written to the Windows Application log unless `windows_event_log` is false. Repeated failed authentications from one IP address are banned for 15 minutes, then 30, then 60, then permanently (`auth_ban_schedule`). Clear a ban with `rose ctl unban <ip>` or `rose ctl unban all`. `antibot` is `off`, `delay`, or `block`. `delay` slows repeat connections that have not logged in, and a successful login removes that delay. `block` bans an address that only checks the port.
 
 ### NixOS
 

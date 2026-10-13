@@ -4,7 +4,9 @@
 //! handshake and while watching live sessions, so changes apply without a
 //! restart.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use clap::Subcommand;
 
@@ -61,6 +63,13 @@ pub(super) enum CtlAction {
         #[command(subcommand)]
         action: TotpAction,
     },
+    /// List authentication bans.
+    Bans,
+    /// Clear one banned IP address, or every ban when the address is `all`.
+    Unban {
+        /// IP address, or `all`.
+        ip: String,
+    },
 }
 
 /// `rose ctl totp` actions.
@@ -94,7 +103,9 @@ pub(super) fn run_ctl(
         }
         CtlAction::Authorize { cert, name } => {
             let dest = authorize_client_cert(&paths, &cert, name.as_deref())?;
-            println!("authorized {}", dest.display());
+            let account = crate::client_account::bind_cert(&dest);
+            log_client_accepted(&paths.config_dir, &account, "manual", &dest);
+            println!("authorized {} for {}", dest.display(), account.label());
         }
         CtlAction::Revoke { name } => {
             let dest = revoke_client_cert(&paths, &name)?;
@@ -110,7 +121,9 @@ pub(super) fn run_ctl(
                 &code,
                 totp.as_deref(),
             )?;
-            println!("authorized {}", dest.display());
+            let account = crate::client_account::bind_cert(&dest);
+            log_client_accepted(&paths.config_dir, &account, &code, &dest);
+            println!("authorized {} for {}", dest.display(), account.label());
         }
         CtlAction::Deny { code } => {
             let dest = config::deny_pending_client_cert(&paths.config_dir, &code)?;
@@ -122,8 +135,42 @@ pub(super) fn run_ctl(
             let (_secret, uri) = crate::totp::init_operator_totp(&paths.config_dir)?;
             println!("{uri}");
         }
+        CtlAction::Bans => {
+            print!(
+                "{}",
+                crate::auth_guard::list_bans(&paths.config_dir, SystemTime::now())
+            );
+        }
+        CtlAction::Unban { ip } => {
+            if ip.eq_ignore_ascii_case("all") {
+                crate::auth_guard::clear_bans(&paths.config_dir);
+                println!("cleared authentication bans");
+            } else {
+                let address: IpAddr = ip
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("expected an IP address or 'all'"))?;
+                if crate::auth_guard::clear_ban(&paths.config_dir, address) {
+                    println!("cleared {address}");
+                } else {
+                    println!("no ban for {address}");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn log_client_accepted(
+    config_dir: &Path,
+    account: &crate::client_account::ClientAccount,
+    code: &str,
+    cert: &Path,
+) {
+    let config = RoseConfig::load(config_dir).unwrap_or_default();
+    crate::security_log::emit(
+        config.windows_event_log,
+        &crate::security_log::pairing_message(&account.user, &account.sid, code, cert),
+    );
 }
 
 fn format_pending(config_dir: &Path) -> String {
@@ -183,6 +230,7 @@ fn revoke_client_cert(paths: &RosePaths, name: &str) -> anyhow::Result<PathBuf> 
         anyhow::bail!("no authorized certificate named {}", dest.display());
     }
     std::fs::remove_file(&dest)?;
+    let _ = std::fs::remove_file(crate::client_account::sidecar(&dest));
     Ok(dest)
 }
 
@@ -281,6 +329,11 @@ mod tests {
             &paths.authorized_certs_dir,
             cert.cert_der.as_ref()
         ));
+        let bound = crate::client_account::read_for_cert(
+            &paths.authorized_certs_dir,
+            cert.cert_der.as_ref(),
+        );
+        assert!(bound.is_some());
         assert!(format_pending(dir.path()).contains("no pending"));
 
         let other = crate::config::generate_self_signed_cert(&["other".to_string()]).unwrap();
@@ -338,5 +391,45 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ctl_unban_clears_a_stored_ban() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = crate::auth_guard::GuardSettings::from_config(&RoseConfig::default());
+        settings.ban_after = 1;
+        let address = "203.0.113.9".parse().unwrap();
+        let access = crate::auth_guard::auth_failure(
+            dir.path(),
+            &settings,
+            address,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+        assert!(matches!(access, crate::auth_guard::Access::Banned(_)));
+        run_ctl(
+            Some(dir.path().to_path_buf()),
+            Some(CtlAction::Unban {
+                ip: address.to_string(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            crate::auth_guard::list_bans(dir.path(), SystemTime::now())
+                .contains("no authentication")
+        );
+        run_ctl(
+            Some(dir.path().to_path_buf()),
+            Some(CtlAction::Unban { ip: "all".into() }),
+        )
+        .unwrap();
+        assert!(
+            run_ctl(
+                Some(dir.path().to_path_buf()),
+                Some(CtlAction::Unban {
+                    ip: "not-an-ip".into()
+                }),
+            )
+            .is_err()
+        );
     }
 }

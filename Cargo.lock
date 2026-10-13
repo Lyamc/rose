@@ -3841,6 +3841,7 @@ dependencies = [
  "wezterm-surface",
  "wezterm-term",
  "windows-service",
+ "windows-sys 0.61.2",
  "winreg 0.56.0",
  "x509-parser",
 ]

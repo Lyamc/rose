@@ -79,6 +79,45 @@ pub struct RoseConfig {
 
     /// Optional OIDC client secret.
     pub sso_client_secret: Option<String>,
+
+    /// When `false` (the default), a shell cannot run as `LocalSystem`.
+    /// The shell runs as the Windows user who approved the client certificate.
+    /// Set this to `true` and connect with `--system` to open a `LocalSystem` shell.
+    #[serde(alias = "windowsrootaccess")]
+    pub windows_root_access: bool,
+
+    /// Write pairing approvals and login attempts to the Windows Application log.
+    /// Set this to `false` to keep those events in the tracing log only.
+    pub windows_event_log: bool,
+
+    /// Failed authentications from one IP address before that address is banned.
+    /// Defaults to 5. The ban lengths are [`Self::auth_ban_schedule`].
+    pub auth_ban_after: u32,
+
+    /// Seconds that failed authentications from one address stay counted.
+    /// Defaults to 15 minutes.
+    pub auth_ban_window_secs: u64,
+
+    /// Comma-separated ban lengths. Each later ban is the next entry.
+    /// `15m,30m,60m,-1` bans for 15 minutes, then 30, then 60, then permanently.
+    /// `-1` stays until `rose ctl unban`. `none` disables bans.
+    pub auth_ban_schedule: String,
+
+    /// What to do with addresses that connect and do not authenticate.
+    /// `off` does nothing extra. `delay` slows repeat attempts until a login
+    /// succeeds. `block` bans the address after [`Self::antibot_probe_limit`]
+    /// such connections, using [`Self::auth_ban_schedule`].
+    pub antibot: String,
+
+    /// First delay, in milliseconds, for [`Self::antibot`] `delay`.
+    /// Each further unauthenticated connection doubles it.
+    pub antibot_delay_ms: u64,
+
+    /// Maximum antibot delay, in milliseconds.
+    pub antibot_delay_cap_ms: u64,
+
+    /// Unauthenticated connections before `antibot = "block"` bans the address.
+    pub antibot_probe_limit: u32,
 }
 
 /// Seven days in seconds (default idle timeout for detached sessions).
@@ -110,6 +149,15 @@ impl Default for RoseConfig {
             sso_issuer: None,
             sso_client_id: None,
             sso_client_secret: None,
+            windows_root_access: false,
+            windows_event_log: true,
+            auth_ban_after: 5,
+            auth_ban_window_secs: 15 * 60,
+            auth_ban_schedule: "15m,30m,60m,-1".to_string(),
+            antibot: "off".to_string(),
+            antibot_delay_ms: 2_000,
+            antibot_delay_cap_ms: 30_000,
+            antibot_probe_limit: 5,
         }
     }
 }
@@ -176,6 +224,15 @@ impl RoseConfig {
             "sso_issuer",
             "sso_client_id",
             "sso_client_secret",
+            "windows_root_access",
+            "windows_event_log",
+            "auth_ban_after",
+            "auth_ban_window_secs",
+            "auth_ban_schedule",
+            "antibot",
+            "antibot_delay_ms",
+            "antibot_delay_cap_ms",
+            "antibot_probe_limit",
         ]
     }
 
@@ -212,6 +269,15 @@ impl RoseConfig {
             "sso_issuer" => Ok(optional_string(&self.sso_issuer)),
             "sso_client_id" => Ok(optional_string(&self.sso_client_id)),
             "sso_client_secret" => Ok(optional_string(&self.sso_client_secret)),
+            "windows_root_access" => Ok(self.windows_root_access.to_string()),
+            "windows_event_log" => Ok(self.windows_event_log.to_string()),
+            "auth_ban_after" => Ok(self.auth_ban_after.to_string()),
+            "auth_ban_window_secs" => Ok(self.auth_ban_window_secs.to_string()),
+            "auth_ban_schedule" => Ok(self.auth_ban_schedule.clone()),
+            "antibot" => Ok(self.antibot.clone()),
+            "antibot_delay_ms" => Ok(self.antibot_delay_ms.to_string()),
+            "antibot_delay_cap_ms" => Ok(self.antibot_delay_cap_ms.to_string()),
+            "antibot_probe_limit" => Ok(self.antibot_probe_limit.to_string()),
             _ => Err(ConfigError::UnknownKey(key.to_string())),
         }
     }
@@ -255,6 +321,52 @@ impl RoseConfig {
             "sso_issuer" => self.sso_issuer = parse_optional_string(key, value)?,
             "sso_client_id" => self.sso_client_id = parse_optional_string(key, value)?,
             "sso_client_secret" => self.sso_client_secret = parse_optional_string(key, value)?,
+            "windows_root_access" | "windowsrootaccess" => {
+                self.windows_root_access = parse_bool(key, value)?;
+            }
+            "windows_event_log" => self.windows_event_log = parse_bool(key, value)?,
+            "auth_ban_after" => {
+                let count: u32 = value.parse().map_err(|_| invalid_value(key, value))?;
+                if count == 0 {
+                    return Err(invalid_value(key, value));
+                }
+                self.auth_ban_after = count;
+            }
+            "auth_ban_window_secs" => {
+                let secs: u64 = value.parse().map_err(|_| invalid_value(key, value))?;
+                if secs == 0 {
+                    return Err(invalid_value(key, value));
+                }
+                self.auth_ban_window_secs = secs;
+            }
+            "auth_ban_schedule" => {
+                let schedule = crate::auth_guard::parse_schedule(value)
+                    .map_err(|()| invalid_value(key, value))?;
+                self.auth_ban_schedule = crate::auth_guard::format_schedule(&schedule);
+            }
+            "antibot" => {
+                let mode = crate::auth_guard::parse_antibot(value)
+                    .map_err(|()| invalid_value(key, value))?;
+                self.antibot = match mode {
+                    crate::auth_guard::Antibot::Off => "off",
+                    crate::auth_guard::Antibot::Delay => "delay",
+                    crate::auth_guard::Antibot::Block => "block",
+                }
+                .to_string();
+            }
+            "antibot_delay_ms" => {
+                self.antibot_delay_ms = value.parse().map_err(|_| invalid_value(key, value))?;
+            }
+            "antibot_delay_cap_ms" => {
+                self.antibot_delay_cap_ms = value.parse().map_err(|_| invalid_value(key, value))?;
+            }
+            "antibot_probe_limit" => {
+                let limit: u32 = value.parse().map_err(|_| invalid_value(key, value))?;
+                if limit == 0 {
+                    return Err(invalid_value(key, value));
+                }
+                self.antibot_probe_limit = limit;
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         Ok(())
@@ -1880,6 +1992,14 @@ mod tests {
         assert_eq!(cfg.pairing_code_digits, 8);
         assert!(!cfg.totp_required);
         assert!(cfg.sso_issuer.is_none());
+        assert!(!cfg.windows_root_access);
+        assert!(cfg.windows_event_log);
+        assert_eq!(cfg.auth_ban_after, 5);
+        assert_eq!(cfg.auth_ban_window_secs, 15 * 60);
+        assert_eq!(cfg.auth_ban_schedule, "15m,30m,60m,-1");
+        assert_eq!(cfg.antibot, "off");
+        assert_eq!(cfg.antibot_delay_ms, 2_000);
+        assert_eq!(cfg.antibot_probe_limit, 5);
     }
 
     #[test]
@@ -1953,6 +2073,15 @@ mod tests {
             sso_issuer: Some("https://idp.example".into()),
             sso_client_id: Some("rose".into()),
             sso_client_secret: None,
+            windows_root_access: true,
+            windows_event_log: false,
+            auth_ban_after: 3,
+            auth_ban_window_secs: 600,
+            auth_ban_schedule: "none".to_string(),
+            antibot: "delay".to_string(),
+            antibot_delay_ms: 500,
+            antibot_delay_cap_ms: 5_000,
+            antibot_probe_limit: 2,
         };
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: RoseConfig = toml::from_str(&serialized).unwrap();
@@ -1985,6 +2114,17 @@ mod tests {
         assert_eq!(loaded.get_key("require_client_certs").unwrap(), "false");
         assert_eq!(loaded.get_key("max_sessions").unwrap(), "3");
         assert_eq!(loaded.get_key("retry_interval_secs").unwrap(), "none");
+        cfg.set_key("windowsrootaccess", "true").unwrap();
+        cfg.set_key("auth_ban_schedule", "none").unwrap();
+        cfg.set_key("antibot", "latency").unwrap();
+        cfg.set_key("auth_ban_after", "4").unwrap();
+        assert!(cfg.windows_root_access);
+        assert_eq!(cfg.auth_ban_schedule, "none");
+        assert_eq!(cfg.antibot, "delay");
+        assert_eq!(cfg.auth_ban_after, 4);
+        assert!(cfg.set_key("auth_ban_schedule", "forever").is_err());
+        assert!(cfg.set_key("auth_ban_after", "0").is_err());
+        assert!(cfg.set_key("antibot", "maybe").is_err());
         assert!(matches!(
             loaded.get_key("not_a_key"),
             Err(ConfigError::UnknownKey(_))

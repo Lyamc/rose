@@ -65,6 +65,14 @@ impl QuicServer {
         })
     }
 
+    /// Returns the next incoming connection before the handshake finishes.
+    ///
+    /// `None` means the endpoint has been closed. The caller can read the peer
+    /// address and delay or refuse the handshake before awaiting it.
+    pub async fn next_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
     /// Accepts the next incoming QUIC connection.
     ///
     /// Returns `None` if the endpoint has been closed. After a successful

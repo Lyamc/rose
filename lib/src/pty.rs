@@ -42,6 +42,21 @@ pub enum PtyError {
     Io(#[from] std::io::Error),
 }
 
+/// A PTY whose child process is already running.
+pub(crate) struct SpawnedPty {
+    /// Master side of the PTY. Its writer has already been taken.
+    pub master: Box<dyn MasterPty + Send>,
+    /// The shell process.
+    pub child: Box<dyn Child + Send + Sync>,
+    /// Output from the shell.
+    pub reader: Box<dyn std::io::Read + Send>,
+    /// Input to the shell.
+    pub writer: Box<dyn std::io::Write + Send>,
+    /// Closing this descriptor interrupts a blocked Unix read or write.
+    #[cfg(unix)]
+    pub cancel_io: Option<filedescriptor::FileDescriptor>,
+}
+
 /// Manages a PTY lifecycle: spawning a child process, reading output,
 /// writing input, and handling resize events.
 pub struct PtySession {
@@ -147,6 +162,38 @@ impl PtySession {
         Self::open_internal(rows, cols, cmd, true)
     }
 
+    /// Builds a session around a PTY that was already spawned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError::Io`] when the master writer cannot be taken.
+    pub(crate) fn from_spawned(
+        rows: u16,
+        cols: u16,
+        emulate: bool,
+        spawned: SpawnedPty,
+    ) -> Result<Self, PtyError> {
+        let SpawnedPty {
+            master,
+            child,
+            reader,
+            writer,
+            #[cfg(unix)]
+            cancel_io,
+        } = spawned;
+        Ok(Self::start(
+            rows,
+            cols,
+            emulate,
+            master,
+            child,
+            reader,
+            writer,
+            #[cfg(unix)]
+            cancel_io,
+        ))
+    }
+
     /// Returns the authoritative emulator created by [`Self::open_terminal`].
     #[must_use]
     pub const fn terminal(&self) -> Option<&Arc<Mutex<RoseTerminal>>> {
@@ -181,6 +228,37 @@ impl PtySession {
             .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
         #[cfg(unix)]
         let writer: Box<dyn std::io::Write + Send> = Box::new(io.wrap(writer));
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
+        #[cfg(unix)]
+        let reader: Box<dyn std::io::Read + Send> = Box::new(io.wrap(reader));
+        Self::from_spawned(
+            rows,
+            cols,
+            emulate,
+            SpawnedPty {
+                master: pair.master,
+                child,
+                reader,
+                writer,
+                #[cfg(unix)]
+                cancel_io: Some(cancel_io),
+            },
+        )
+    }
+
+    fn start(
+        rows: u16,
+        cols: u16,
+        emulate: bool,
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+        mut reader: Box<dyn std::io::Read + Send>,
+        writer: Box<dyn std::io::Write + Send>,
+        #[cfg(unix)] cancel_io: Option<filedescriptor::FileDescriptor>,
+    ) -> Self {
         let writer = Arc::new(Mutex::new(writer));
         let terminal = emulate.then(|| {
             Arc::new(Mutex::new(RoseTerminal::with_writer(
@@ -193,14 +271,6 @@ impl PtySession {
 
         let (output_tx, initial_rx) = broadcast::channel(256);
         let tx = output_tx.clone();
-
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))?;
-        #[cfg(unix)]
-        let reader: Box<dyn std::io::Read + Send> = Box::new(io.wrap(reader));
-        let mut reader = reader;
 
         // Notified when the reader thread exits (shell closed / PTY EOF).
         let pty_closed = Arc::new(Notify::new());
@@ -235,19 +305,19 @@ impl PtySession {
             closed.notify_one();
         });
 
-        Ok(Self {
+        Self {
             writer,
             #[cfg(unix)]
-            cancel_io: Some(cancel_io),
+            cancel_io,
             input: OnceLock::new(),
-            master: pair.master,
+            master,
             child: Some(child),
             output_tx,
             initial_rx: Mutex::new(Some(initial_rx)),
             pty_closed,
             terminal,
             _reader_handle: reader_handle,
-        })
+        }
     }
 
     /// Subscribes to PTY output.

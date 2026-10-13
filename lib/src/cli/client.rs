@@ -157,6 +157,14 @@ fn collect_env_vars() -> Vec<(String, String)> {
     vars
 }
 
+/// Whether `rose connect` asked for an elevated or `LocalSystem` shell.
+pub(super) struct ShellChoice {
+    /// Request the approved user's elevated token.
+    pub elevate: bool,
+    /// Request a `LocalSystem` shell.
+    pub system: bool,
+}
+
 /// COVERAGE: CLI client loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) async fn run_client(
@@ -166,7 +174,12 @@ pub(super) async fn run_client(
     client_cert_path: Option<PathBuf>,
     session_id: Option<[u8; 16]>,
     retry_flags: super::retry::RetryFlags,
+    shell: ShellChoice,
 ) -> anyhow::Result<()> {
+    let ShellChoice { elevate, system } = shell;
+    if elevate && system {
+        anyhow::bail!("use either --elevate or --system");
+    }
     let reattach_command = connect_command(
         host,
         port,
@@ -226,15 +239,18 @@ pub(super) async fn run_client(
 
     let _raw_guard = RawModeGuard::enable()?;
 
-    client_session_loop(
+    client_session_loop(SessionLoopConfig {
         addr,
-        host,
+        server_name: host,
         client_config,
+        start: LoopStart::Fresh,
         session_id,
         reattach_command,
         retry,
-        None,
-    )
+        pairing_code: None,
+        elevate,
+        system,
+    })
     .await
 }
 
@@ -299,26 +315,8 @@ async fn tofu_first_connect(
 ///
 /// COVERAGE: CLI client session loop is tested via integration/e2e tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(super) async fn client_session_loop(
-    addr: SocketAddr,
-    server_name: &str,
-    client_config: quinn::ClientConfig,
-    session_id: Option<[u8; 16]>,
-    reattach_command: String,
-    retry: RetryPolicy,
-    pairing_code: Option<String>,
-) -> anyhow::Result<()> {
-    client_session_loop_inner(SessionLoopConfig {
-        addr,
-        server_name,
-        client_config,
-        start: LoopStart::Fresh,
-        session_id,
-        reattach_command,
-        retry,
-        pairing_code,
-    })
-    .await
+async fn client_session_loop(config: SessionLoopConfig<'_>) -> anyhow::Result<()> {
+    client_session_loop_inner(config).await
 }
 
 /// Like [`client_session_loop`] but uses a pre-established connection for the
@@ -343,6 +341,8 @@ pub(super) async fn client_session_loop_with_conn(
         reattach_command,
         retry,
         pairing_code: None,
+        elevate: false,
+        system: false,
     })
     .await
 }
@@ -376,6 +376,8 @@ pub(super) async fn client_session_loop_with_client(
         reattach_command,
         retry,
         pairing_code: None,
+        elevate: false,
+        system: false,
     })
     .await
 }
@@ -553,6 +555,8 @@ struct SessionLoopConfig<'a> {
     reattach_command: String,
     retry: RetryPolicy,
     pairing_code: Option<String>,
+    elevate: bool,
+    system: bool,
 }
 
 /// Core reconnection loop. If `first_conn` is provided, skips the connect
@@ -571,6 +575,8 @@ async fn client_session_loop_inner(config: SessionLoopConfig<'_>) -> anyhow::Res
         reattach_command,
         retry,
         pairing_code,
+        elevate,
+        system,
     } = config;
     let (mut initial_conn, stun_ctx) = match start {
         LoopStart::Fresh => (None, None),
@@ -702,7 +708,19 @@ async fn client_session_loop_inner(config: SessionLoopConfig<'_>) -> anyhow::Res
         };
 
         let (cols, rows) = terminal::size()?;
-        let env = collect_env_vars();
+        let mut env = collect_env_vars();
+        if elevate && session_id.is_none() {
+            env.push((
+                crate::shell_account::ELEVATE_ENV.to_string(),
+                "1".to_string(),
+            ));
+        }
+        if system && session_id.is_none() {
+            env.push((
+                crate::shell_account::SYSTEM_ENV.to_string(),
+                "1".to_string(),
+            ));
+        }
         let mut session = if let Some(sid) = session_id {
             match ClientSession::reconnect(conn, rows, cols, sid, env).await {
                 Ok(s) => s,

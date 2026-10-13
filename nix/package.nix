@@ -36,7 +36,7 @@ rustPlatform.buildRustPackage (_finalAttrs: {
     ];
   };
 
-  cargoHash = "sha256-A80zwcAXfPXdjddmATW/Bnd+3hyEm403U+EVImpw+BQ=";
+  cargoHash = "sha256-xA1eBfAhV+g51IlscgAxVVMuZEbLhKroNq87UrjLaNY=";
 
   preConfigure = ''
     mapfile -t crates < <(find "$NIX_BUILD_TOP" -type d -name 'wezterm-term-*')

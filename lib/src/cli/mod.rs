@@ -87,6 +87,18 @@ enum Commands {
         /// 1, 2, 3, 5, 5, 5, 10, 10, 10, 30, 60, 120, ... up to one hour.
         #[arg(long, value_name = "SECONDS")]
         retry_interval: Option<u64>,
+
+        /// Open an elevated shell. Only a system service can do this, and it
+        /// uses the logon's existing elevated token, so Windows does not show
+        /// a consent prompt. A user install cannot elevate.
+        #[arg(long)]
+        elevate: bool,
+
+        /// Open a `LocalSystem` shell. Requires `windows_root_access = true`
+        /// on a system service. The default shell is the Windows user who
+        /// approved this client.
+        #[arg(long)]
+        system: bool,
     },
     /// Run the `RoSE` server daemon.
     Server {
@@ -104,6 +116,12 @@ enum Commands {
         /// TLS hostname verification in native mode.
         #[arg(long)]
         hostname: Vec<String>,
+
+        /// Directory for the certificate, config, and authorized clients.
+        /// Defaults to `config.toml` next to this executable, then
+        /// `%ProgramData%\RoSE` on Windows or `$HOME/.config/rose` on Unix.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
     },
     /// Inspect or change the persistent server configuration.
     ///
@@ -140,6 +158,12 @@ enum ServiceAction {
         /// Hostnames to include in the server certificate's Subject Alternative Names.
         #[arg(long)]
         hostname: Vec<String>,
+
+        /// Install for the current user. The server starts at logon as that
+        /// user and cannot elevate. Without this flag, the service runs as
+        /// `LocalSystem`, starts before anyone logs on, and can elevate.
+        #[arg(long)]
+        user: bool,
     },
     /// Stop the service, remove the firewall rule and system PATH entry, and delete the installed binary.
     Uninstall,
@@ -234,6 +258,8 @@ pub async fn run() -> anyhow::Result<()> {
             always_retry,
             retry_limit,
             retry_interval,
+            elevate,
+            system,
         } => {
             let retry_flags = retry::RetryFlags {
                 always_retry,
@@ -251,18 +277,32 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .await
             } else {
-                client::run_client(&host, port, cert, client_cert, session, retry_flags).await
+                client::run_client(
+                    &host,
+                    port,
+                    cert,
+                    client_cert,
+                    session,
+                    retry_flags,
+                    client::ShellChoice { elevate, system },
+                )
+                .await
             }
         }
         Commands::Server {
             listen,
             bootstrap,
             hostname,
-        } => server::run_server(listen, bootstrap, hostname).await,
+            config_dir,
+        } => server::run_server(listen, bootstrap, hostname, config_dir).await,
         Commands::Ctl { config_dir, action } => ctl::run_ctl(config_dir, action),
         Commands::Keygen => keygen::run_keygen(),
         Commands::Service { action } => match action {
-            ServiceAction::Install { listen, hostname } => service::install(listen, hostname),
+            ServiceAction::Install {
+                listen,
+                hostname,
+                user,
+            } => service::install(listen, hostname, user),
             ServiceAction::Uninstall => service::uninstall(),
             ServiceAction::Run {
                 listen,
@@ -451,11 +491,35 @@ mod tests {
         let Commands::Service { action } = install.command else {
             panic!("expected service");
         };
-        let ServiceAction::Install { listen, hostname } = action else {
+        let ServiceAction::Install {
+            listen,
+            hostname,
+            user,
+        } = action
+        else {
             panic!("expected install");
         };
         assert_eq!(listen, "192.0.2.10:4433".parse().unwrap());
         assert_eq!(hostname, vec!["rose.example".to_string()]);
+        assert!(!user);
+        let user_install = Cli::try_parse_from(["rose", "service", "install", "--user"]).unwrap();
+        assert!(matches!(
+            user_install.command,
+            Commands::Service {
+                action: ServiceAction::Install { user: true, .. }
+            }
+        ));
+        let elevated =
+            Cli::try_parse_from(["rose", "connect", "--elevate", "rose.example"]).unwrap();
+        assert!(matches!(
+            elevated.command,
+            Commands::Connect { elevate: true, .. }
+        ));
+        let system = Cli::try_parse_from(["rose", "connect", "--system", "rose.example"]).unwrap();
+        assert!(matches!(
+            system.command,
+            Commands::Connect { system: true, .. }
+        ));
 
         let uninstall = Cli::try_parse_from(["rose", "service", "uninstall"]).unwrap();
         assert!(matches!(
